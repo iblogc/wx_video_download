@@ -1,0 +1,11 @@
+# 运行产物（bot.env 含 token，绝不提交）
+bot.env
+bot.log
+bot.pid
+downloads/
+
+# 视频文件
+*.mp4
+
+# macOS
+.DS_Store
