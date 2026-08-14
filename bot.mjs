@@ -41,7 +41,8 @@ if (!TOKEN) {
 }
 
 // ---------- 工具 ----------
-const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const tzFmt = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const log = (...a) => console.log(tzFmt.format(new Date()), ...a);
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
@@ -170,7 +171,7 @@ class Semaphore {
 }
 const dlSem = new Semaphore(MAX_CONCURRENT_DOWNLOADS);
 
-// ---------- 全局缓存索引（短码 → 文件归属） ----------
+// ---------- 全局缓存索引（短码 → 文件，平铺于 downloads/ 根） ----------
 const CACHE_FILE = path.join(DOWNLOADS_DIR, 'cache.json');
 function loadCache() {
   try { return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch { return {}; }
@@ -180,7 +181,7 @@ function saveCache(c) {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(c, null, 2));
 }
 function cachePathOf(entry) {
-  return entry && path.join(DOWNLOADS_DIR, String(entry.owner), entry.file);
+  return entry && path.join(DOWNLOADS_DIR, entry.file);
 }
 function cacheFileExists(entry) {
   const p = cachePathOf(entry);
@@ -196,17 +197,8 @@ function dedupe(key, fn) {
   return p;
 }
 
-// 确保当前用户目录存在该视频文件（新下载后 / 缓存命中时补硬链接）
-function ensureUserFile(srcPath, outPath) {
-  if (fs.existsSync(outPath)) return outPath;
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  try { fs.linkSync(srcPath, outPath); } catch { fs.copyFileSync(srcPath, outPath); }   // 硬链接失败则复制兜底
-  return outPath;
-}
-
 // ---------- 核心流程 ----------
 async function processLink(chatId, userId, link) {
-  const dir = path.join(DOWNLOADS_DIR, String(userId));
   let info, id, shortCode;
   try {
     await sendMessage(chatId, '🔄 正在解析...');
@@ -218,51 +210,57 @@ async function processLink(chatId, userId, link) {
     return;
   }
 
-  const title = cleanTitle(info.title, 'video');
-  const outPath = path.join(dir, title + '.mp4');
-  fs.mkdirSync(dir, { recursive: true });
+  const base = cleanTitle(info.title, 'video');
+  const cache = loadCache();
+  const entry = cache[shortCode];
 
-  const entry = loadCache()[shortCode];
-  if (!cacheFileExists(entry)) {
-    // 未命中：下载（带在途去重）
+  let filePath;
+  if (cacheFileExists(entry)) {
+    // 缓存命中：直接复用，不重复下载
+    filePath = cachePathOf(entry);
+    log(`[${userId}] 命中缓存: ${entry.file}`);
+  } else {
+    // 未命中：确定不冲突的文件名（平铺于 downloads/ 根，重名自动加序号）
+    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+    const used = new Set(fs.readdirSync(DOWNLOADS_DIR));
+    let file = base + '.mp4', n = 2;
+    while (used.has(file)) file = `${base} (${n++}).mp4`;
+    filePath = path.join(DOWNLOADS_DIR, file);
+
     await sendMessage(chatId, `⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
     try {
       await dedupe(shortCode, async () => {
         // 等待者进入时第一个可能已完成，再查一次
         const c = loadCache();
-        const e = c[shortCode];
-        if (cacheFileExists(e)) return;
+        if (cacheFileExists(c[shortCode])) return;
         await dlSem.acquire();
-        try { await downloadVideo(info, outPath); } finally { dlSem.release(); }
-        c[shortCode] = { owner: String(userId), file: title + '.mp4', size: info.fileSize };
+        try { await downloadVideo(info, filePath); } finally { dlSem.release(); }
+        c[shortCode] = { file, size: info.fileSize };
         saveCache(c);
       });
+      // 权威路径以缓存为准（并发等待者可能由他人完成下载）
+      const fin = loadCache()[shortCode];
+      if (fin) filePath = cachePathOf(fin);
     } catch (e) {
       await sendMessage(chatId, '❌ 下载失败: ' + e.message.slice(0, 200));
       return;
     }
-  } else {
-    log(`[${userId}] 命中缓存: ${title}.mp4`);
   }
 
-  // 确保当前用户目录有文件（新下载的直接在，复用/等待者补硬链接）
-  const gotEntry = loadCache()[shortCode];
-  const gotPath = gotEntry ? ensureUserFile(cachePathOf(gotEntry), outPath) : outPath;
-
   if (info.fileSize > MAX_UPLOAD) {
-    await sendMessage(chatId, `⚠️ 视频 ${(info.fileSize / 1048576).toFixed(1)} MB 超过 Telegram 50MB 上限，无法发送。已保存到本机 downloads/${userId}/${title}.mp4。`);
+    await sendMessage(chatId, `⚠️ 视频 ${(info.fileSize / 1048576).toFixed(1)} MB 超过 Telegram 50MB 上限，无法发送。已保存到本机 downloads/${path.basename(filePath)}。`);
     return;
   }
 
   const shortId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const meta = loadGlobalMeta();
-  meta[shortId] = { userId: String(userId), file: title + '.mp4', size: info.fileSize };
+  meta[shortId] = { file: path.basename(filePath), size: info.fileSize };
   saveGlobalMeta(meta);
 
   try {
     await sendChatAction(chatId, 'upload_video');
-    await tgWithRetry(() => sendVideoWithButton(chatId, gotPath, shortId));
-    log(`[${userId}] 发送成功: ${title}.mp4`);
+    await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId));
+    log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
   } catch (e) {
     await sendMessage(chatId, '❌ 上传失败: ' + e.message.slice(0, 200));
   }
@@ -278,7 +276,7 @@ async function handleCallback(query) {
     await answerCallback(query.id, '原文件已过期或已被清理');
     return;
   }
-  const filePath = path.join(DOWNLOADS_DIR, rec.userId, rec.file);
+  const filePath = path.join(DOWNLOADS_DIR, rec.file);
   if (!fs.existsSync(filePath)) {
     await answerCallback(query.id, '文件已不存在');
     return;

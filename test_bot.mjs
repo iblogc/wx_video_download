@@ -56,7 +56,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-const file = 'downloads/12345/只爱我一个不好吗？.mp4';
+const file = 'downloads/只爱我一个不好吗？.mp4';
 
 server.listen(PORT, async () => {
   updateQueue.push({

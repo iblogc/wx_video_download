@@ -61,24 +61,20 @@ server.listen(PORT, async () => {
   }
 
   const downloadingMsgs = sentMsgs.filter((m) => m.text.includes('正在下载'));
-  const fileA = 'downloads/12345/只爱我一个不好吗？.mp4';
-  const fileB = 'downloads/67890/只爱我一个不好吗？.mp4';
+  const mp4s = fs.readdirSync('downloads').filter((f) => f.endsWith('.mp4'));
   const cache = JSON.parse(fs.readFileSync('downloads/cache.json', 'utf8'));
 
   const once = Object.keys(cache).length === 1;                 // 缓存仅 1 个条目 = 只真实下载一次
   const bothGot = sendVideoCount >= 2;                          // 两人都收到
-  const bHas = fs.existsSync(fileB) && fs.statSync(fileB).size > 0;   // B 目录有文件
-  const sameInode = fs.existsSync(fileA) && fs.existsSync(fileB)
-    ? fs.statSync(fileA).ino === fs.statSync(fileB).ino         // 硬链接（同一 inode）
-    : false;
-  const cacheOk = cache['A9TdAV4DFB'] && cache['A9TdAV4DFB'].file;
+  const oneFile = mp4s.length === 1 && mp4s[0] === '只爱我一个不好吗？.mp4';  // 平铺：只有一个文件
+  const cacheOk = cache['A9TdAV4DFB'] && cache['A9TdAV4DFB'].file === '只爱我一个不好吗？.mp4';
 
   console.log('RESULT 仅下载一次:', once, '| 下载消息数:', downloadingMsgs.length);
   console.log('RESULT 两人都收到视频:', bothGot, '| sendVideo:', sendVideoCount);
-  console.log('RESULT B目录有文件:', bHas, '| 与A同inode(硬链接):', sameInode);
+  console.log('RESULT 平铺单文件:', oneFile, '| 文件:', JSON.stringify(mp4s));
   console.log('RESULT cache.json 条目:', cacheOk ? JSON.stringify(cache['A9TdAV4DFB']) : '缺失');
 
   bot.kill();
   server.close();
-  process.exit(once && bothGot && bHas && sameInode && cacheOk ? 0 : 1);
+  process.exit(once && bothGot && oneFile && cacheOk ? 0 : 1);
 });
