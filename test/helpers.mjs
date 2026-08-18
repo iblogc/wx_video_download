@@ -34,7 +34,7 @@ export function startMockTelegram(port) {
       case 'getUpdates':
         return res.end(JSON.stringify({ ok: true, result: queue.splice(0, queue.length) }));
       case 'sendMessage':
-        stats.texts.push({ chat: url.searchParams.get('chat_id'), text: url.searchParams.get('text'), msgId: ++msgSeq });
+        stats.texts.push({ chat: url.searchParams.get('chat_id'), text: url.searchParams.get('text'), msgId: ++msgSeq, replyTo: url.searchParams.get('reply_to_message_id') });
         return res.end(JSON.stringify({ ok: true, result: { message_id: msgSeq } }));
       case 'editMessageText':
         stats.edits++;
@@ -66,6 +66,8 @@ export function startMockTelegram(port) {
                 stats.callbackData = stats.button.callback_data;
               } catch {}
             }
+            const rm = text.match(/name="reply_to_message_id"\r\n\r\n([^\r]+)/);
+            stats.videoReplyTo = rm ? rm[1] : null;
           } else {
             stats.documents++;
           }

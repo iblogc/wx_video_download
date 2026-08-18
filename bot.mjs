@@ -134,10 +134,11 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId, fileSize) {
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId) {
   const data = fs.readFileSync(filePath);
   const { body, contentType } = buildMultipart({
     chat_id: String(chatId),
+    reply_to_message_id: String(replyToMsgId || ''),
     video: data,
     supports_streaming: 'true',
     reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
@@ -232,12 +233,12 @@ async function downloadOrFake(info, filePath) {
   return downloadVideo(info, filePath);
 }
 
-async function processLink(chatId, userId, link) {
-  // 进度消息：首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
+async function processLink(chatId, userId, link, replyToMsgId) {
+  // 进度消息：reply 到用户消息，首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
   let statusMsgId = null;
   const status = async (text) => {
     if (statusMsgId == null) {
-      const r = await tgRequest('sendMessage', { query: { chat_id: chatId, text } });
+      const r = await tgRequest('sendMessage', { query: { chat_id: chatId, text, reply_to_message_id: replyToMsgId } });
       statusMsgId = r.ok ? r.result.message_id : null;
     } else {
       await tgRequest('editMessageText', { query: { chat_id: chatId, message_id: statusMsgId, text } }).catch(() => {});
@@ -324,7 +325,7 @@ async function processLink(chatId, userId, link) {
     await status('⬆️ 正在上传...');
     await sendChatAction(chatId, 'upload_video');
     try {
-      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize));
+      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId));
       await statusDone();
       log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
     } catch (e) {
@@ -384,7 +385,7 @@ async function handleMessage(msg) {
   if (!link) return;
 
   try { parseId(link); } catch { return; }   // 不是视频号链接，静默忽略
-  await processLink(chatId, userId, link);
+  await processLink(chatId, userId, link, msg.message_id);
 }
 
 // ---------- 长轮询主循环 ----------
