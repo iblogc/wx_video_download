@@ -1,15 +1,22 @@
 /**
- * test_bot2.mjs — 群聊识别与白名单场景测试（mock Telegram API）
+ * test_bot2.mjs — 群聊识别与白名单场景测试（mock Telegram + 假网络）
  *
  * 阶段A（无白名单配置）: 群聊带微信链接(不@)→下载; 群聊带普通链接→忽略
  * 阶段B（写入白名单）:   白名单外私聊 → 拒绝（验证配置动态生效）
+ * 数据/配置全部在临时目录，不触碰生产。
  */
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const PORT = 18766;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wxbot-test-'));
+const DL = path.join(TMP, 'dl');
+const CFG = path.join(TMP, 'config.json');
+
 let updateQueue = [];
 let sentMsgs = [];        // { chat, text }
 let sendVideoCount = 0;
@@ -27,6 +34,8 @@ const server = http.createServer((req, res) => {
       sentMsgs.push({ chat: url.searchParams.get('chat_id'), text: url.searchParams.get('text') });
       return res.end(JSON.stringify({ ok: true }));
     case 'sendChatAction':
+      return res.end(JSON.stringify({ ok: true }));
+    case 'setMyCommands':
       return res.end(JSON.stringify({ ok: true }));
     case 'sendVideo': {
       const chunks = [];
@@ -46,23 +55,31 @@ server.listen(PORT, async () => {
   updateQueue.push({ update_id: 2, message: { message_id: 2, chat: { id: 222, type: 'group' }, from: { id: 222 }, text: '今天天气不错 https://example.com/abc' } });
 
   const bot = spawn('node', ['bot.mjs'], {
-    env: { ...process.env, TG_BOT_TOKEN: 'mocktoken', TEST_TG_BASE: 'http://127.0.0.1:' + PORT, http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '' },
+    env: {
+      ...process.env,
+      TG_BOT_TOKEN: 'mocktoken',
+      TEST_TG_BASE: 'http://127.0.0.1:' + PORT,
+      DOWNLOAD_DIR: DL,
+      BOT_CONFIG: CFG,
+      FAKE_NETWORK: '1',
+      http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '',
+    },
   });
   bot.stdout.on('data', (d) => process.stdout.write('[bot] ' + d));
   bot.stderr.on('data', (d) => process.stdout.write('[bot-err] ' + d));
 
   // 等场景1 下载完成
   const t0 = Date.now();
-  while (Date.now() - t0 < 120000) {
+  while (Date.now() - t0 < 30000) {
     if (sendVideoCount >= 1) break;
     await sleep(500);
   }
 
   // 阶段B: 写入白名单（不重启，验证动态读取），发白名单外私聊消息
-  fs.writeFileSync('bot.config.json', JSON.stringify({ allowedUsers: [999] }));
+  fs.writeFileSync(CFG, JSON.stringify({ allowedUsers: [999] }));
   updateQueue.push({ update_id: 3, message: { message_id: 3, chat: { id: 333, type: 'private' }, from: { id: 333 }, text: 'https://weixin.qq.com/sph/A9TdAV4DFB' } });
   const t1 = Date.now();
-  while (Date.now() - t1 < 20000) {
+  while (Date.now() - t1 < 10000) {
     if (sentMsgs.some((m) => m.chat === '333')) break;
     await sleep(500);
   }
@@ -77,6 +94,6 @@ server.listen(PORT, async () => {
 
   bot.kill();
   server.close();
-  fs.unlinkSync('bot.config.json');
+  fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(scene1 && scene2 && scene3 ? 0 : 1);
 });

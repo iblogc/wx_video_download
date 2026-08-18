@@ -19,6 +19,7 @@
  *   - 媒体下载直连（腾讯 CDN 国内可达）
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
@@ -31,9 +32,12 @@ const TG_BASE = process.env.TEST_TG_BASE || 'https://api.telegram.org';
 const MAX_UPLOAD = 50 * 1024 * 1024;                                  // Telegram 上传上限 50MB
 const MAX_CONCURRENT_DOWNLOADS = 3;
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-const DOWNLOADS_DIR = path.join(DIR, 'downloads');
-const CONFIG_PATH = path.join(DIR, 'bot.config.json');
+// 数据目录可配置：DOWNLOAD_DIR 覆盖（测试用），默认 ~/Downloads/wx-videos
+const DOWNLOADS_DIR = process.env.DOWNLOAD_DIR || path.join(os.homedir(), 'Downloads', 'wx-videos');
+const CONFIG_PATH = process.env.BOT_CONFIG || path.join(DIR, 'bot.config.json');
 const GLOBAL_META = path.join(DOWNLOADS_DIR, 'meta.json');
+// FAKE_NETWORK=1：测试模式，解析/下载全部走假数据（离线、毫秒级、零真实文件）
+const FAKE = process.env.FAKE_NETWORK === '1';
 
 if (!TOKEN) {
   console.error('缺少 TG_BOT_TOKEN 环境变量，请先设置（见文件头注释）。');
@@ -206,13 +210,23 @@ function dedupe(key, fn) {
 }
 
 // ---------- 核心流程 ----------
+// FAKE_NETWORK 模式：假解析 + 假下载（测试用，不触网、不写真实视频）
+async function resolveOrFake(id) {
+  if (FAKE) return { url: '', key: Buffer.alloc(0), title: '测试视频', fileSize: 3 * 1024 * 1024 };
+  return resolveVideo(id);
+}
+async function downloadOrFake(info, filePath) {
+  if (FAKE) { fs.writeFileSync(filePath, Buffer.alloc(1024 * 512, 7)); return 1024 * 512; }
+  return downloadVideo(info, filePath);
+}
+
 async function processLink(chatId, userId, link) {
   let info, id, shortCode;
   try {
     await sendMessage(chatId, '🔄 正在解析...');
     id = parseId(link);
     shortCode = id.split('##')[0];
-    info = await resolveVideo(id);
+    info = await resolveOrFake(id);
   } catch (e) {
     await sendMessage(chatId, '❌ 解析失败: ' + e.message.slice(0, 200));
     return;
@@ -243,7 +257,7 @@ async function processLink(chatId, userId, link) {
         }
         fs.closeSync(fd);
         await dlSem.acquire();
-        try { await downloadVideo(info, path.join(DOWNLOADS_DIR, file)); } finally { dlSem.release(); }
+        try { await downloadOrFake(info, path.join(DOWNLOADS_DIR, file)); } finally { dlSem.release(); }
         await withIoLock(() => {
           const c = loadCache();
           c[shortCode] = { file, size: info.fileSize };

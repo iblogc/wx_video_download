@@ -1,16 +1,21 @@
 /**
- * test_bot.mjs — bot.mjs 端到端测试（mock Telegram API）
+ * test_bot.mjs — bot.mjs 端到端测试（mock Telegram + 假网络，完全离线）
  *
- * 流程: 起本地 mock Telegram server → spawn bot.mjs →
- *       注入一条私聊链接消息 → 断言下载分组文件生成、sendVideo 收到、
+ * 流程: 起本地 mock Telegram server → spawn bot.mjs（临时数据目录 + FAKE_NETWORK）→
+ *       注入一条私聊链接消息 → 断言下载文件生成、sendVideo 收到、
  *       注入"获取原文件"callback → 断言 sendDocument 收到。
+ * 不触碰生产数据目录（~/Downloads/wx-videos）。
  */
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const PORT = 18765;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wxbot-test-'));
+const DL = path.join(TMP, 'dl');
 
 let updateQueue = [];
 let sendVideoCount = 0, sendDocumentCount = 0;
@@ -32,6 +37,8 @@ const server = http.createServer((req, res) => {
     case 'sendChatAction':
       return res.end(JSON.stringify({ ok: true }));
     case 'answerCallbackQuery':
+      return res.end(JSON.stringify({ ok: true }));
+    case 'setMyCommands':
       return res.end(JSON.stringify({ ok: true }));
     case 'sendVideo':
     case 'sendDocument': {
@@ -56,7 +63,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-const file = 'downloads/只爱我一个不好吗？.mp4';
+const file = path.join(DL, '测试视频.mp4');
 
 server.listen(PORT, async () => {
   updateQueue.push({
@@ -74,6 +81,9 @@ server.listen(PORT, async () => {
       ...process.env,
       TG_BOT_TOKEN: 'mocktoken',
       TEST_TG_BASE: 'http://127.0.0.1:' + PORT,
+      DOWNLOAD_DIR: DL,
+      BOT_CONFIG: path.join(TMP, 'config.json'),
+      FAKE_NETWORK: '1',
       http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '',
     },
   });
@@ -81,7 +91,7 @@ server.listen(PORT, async () => {
   bot.stderr.on('data', (d) => process.stdout.write('[bot-err] ' + d));
 
   const t0 = Date.now();
-  while (Date.now() - t0 < 120000) {
+  while (Date.now() - t0 < 30000) {
     if (sendVideoCount >= 1 && !callbackInjected && callbackData) {
       callbackInjected = true;
       updateQueue.push({
@@ -99,9 +109,10 @@ server.listen(PORT, async () => {
   }
 
   const okFile = fs.existsSync(file) && fs.statSync(file).size > 0;
-  console.log('RESULT 分组文件存在:', okFile, okFile ? '(' + fs.statSync(file).size + ' bytes)' : '');
+  console.log('RESULT 假网络下载文件存在:', okFile, okFile ? '(' + fs.statSync(file).size + ' bytes)' : '');
   console.log('RESULT sendVideo:', sendVideoCount, '| sendDocument:', sendDocumentCount);
   bot.kill();
   server.close();
+  fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(okFile && sendVideoCount >= 1 && sendDocumentCount >= 1 ? 0 : 1);
 });
