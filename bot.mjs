@@ -96,7 +96,7 @@ function makeTunnelAgent(proxy) {
 const proxyAgent = PROXY ? makeTunnelAgent(PROXY) : null;
 
 // ---------- Telegram API ----------
-function tgRequest(method, { query, body, headers = {} } = {}) {
+function tgRequest(method, { query, body, headers = {}, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(`${TG_BASE}/bot${TOKEN}/${method}`);
     if (query) u.search = new URLSearchParams(query).toString();
@@ -109,6 +109,8 @@ function tgRequest(method, { query, body, headers = {} } = {}) {
       });
     });
     req.on('error', reject);
+    // 网络挂起兜底：默认 90s 超时（getUpdates 长轮询由调用方传 timeoutMs=0）
+    if (timeoutMs !== 0) req.setTimeout(timeoutMs || 90000, () => req.destroy(new Error(method + ' 请求超时')));
     if (body) req.write(body);
     req.end();
   });
@@ -134,15 +136,24 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId) {
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention) {
   const data = fs.readFileSync(filePath);
-  const { body, contentType } = buildMultipart({
+  const fields = {
     chat_id: String(chatId),
     reply_to_message_id: String(replyToMsgId || ''),
     video: data,
     supports_streaming: 'true',
     reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
-  });
+  };
+  if (mention) {   // 群聊：@ 原消息发送人，触发提醒
+    if (mention.type === 'username') {
+      fields.caption = mention.value;
+    } else {
+      fields.caption = mention.value;
+      fields.caption_entities = JSON.stringify([{ type: 'text_mention', offset: 0, length: mention.value.length, user: { id: mention.userId } }]);
+    }
+  }
+  const { body, contentType } = buildMultipart(fields);
   return tgRequest('sendVideo', { body, headers: { 'content-type': contentType } });
 }
 
@@ -233,7 +244,15 @@ async function downloadOrFake(info, filePath) {
   return downloadVideo(info, filePath);
 }
 
-async function processLink(chatId, userId, link, replyToMsgId) {
+// 群聊回复视频时 @ 原消息发送人（有 username 用 @mention；没有则用 text_mention 按 user id 提及）
+function buildMention(chatType, from) {
+  if (chatType === 'private' || !from) return null;
+  if (from.username) return { type: 'username', value: '@' + from.username };
+  const name = String(from.first_name || '用户').slice(0, 64);
+  return { type: 'text_mention', value: name, userId: from.id };
+}
+
+async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
   // 进度消息：reply 到用户消息，首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
   let statusMsgId = null;
   const status = async (text) => {
@@ -253,11 +272,14 @@ async function processLink(chatId, userId, link, replyToMsgId) {
 
   // 进入全局任务池（并发上限 MAX_TASKS，超限回复排队位置）
   const slot = await taskPool.acquire();
-  if (slot.position > 0) log(`[${chatId}:${userId}] 任务进入池: 排队第 ${slot.position} 位（活跃 ${taskPool.active}/${MAX_TASKS}）`);
-  else log(`[${chatId}:${userId}] 任务进入池: 立即执行（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+  if (slot.position > 0) {
+    log(`[${chatId}:${userId}] 任务进入池: 排队第 ${slot.position} 位（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+    await status(`⏳ 当前任务较多，已排队（第 ${slot.position} 位）...`);
+  } else {
+    log(`[${chatId}:${userId}] 任务进入池: 立即执行（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+  }
+  const release = await slot.release;   // 立即获取者即刻返回；排队者等待空位
   try {
-    if (slot.position > 0) await status(`⏳ 当前任务较多，已排队（第 ${slot.position} 位）...`);
-    await slot.promise;
 
     let info, id, shortCode;
     try {
@@ -292,6 +314,17 @@ async function processLink(chatId, userId, link, replyToMsgId) {
           if (cacheFileExists(loadCache()[shortCode])) return;
           fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
           const base2 = base;
+          // 同名文件已存在：先校验是否同一视频（文件字节数一致视为同一，直接复用不重复下载）
+          const existPath = path.join(DOWNLOADS_DIR, base2 + '.mp4');
+          if (fs.existsSync(existPath) && fs.statSync(existPath).size === info.fileSize) {
+            log(`[${chatId}:${userId}] 同名文件且大小一致（同一视频），直接复用: ${base2}.mp4`);
+            await withIoLock(() => {
+              const c = loadCache();
+              c[shortCode] = { file: base2 + '.mp4', size: info.fileSize };
+              saveCache(c);
+            });
+            return;
+          }
           let file = base2 + '.mp4', n = 2, fd = null;
           for (;;) {   // 独占创建，已存在则换序号
             try { fd = fs.openSync(path.join(DOWNLOADS_DIR, file), 'wx'); break; }
@@ -334,7 +367,7 @@ async function processLink(chatId, userId, link, replyToMsgId) {
     await sendChatAction(chatId, 'upload_video');
     const upT0 = Date.now();
     try {
-      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId));
+      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from)));
       await statusDone();
       log(`[${chatId}:${userId}] 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
     } catch (e) {
@@ -342,7 +375,7 @@ async function processLink(chatId, userId, link, replyToMsgId) {
       log(`[${chatId}:${userId}] ❌ 上传失败: ${e.message}`);
     }
   } finally {
-    slot.release();
+    release();
   }
 }
 
@@ -404,7 +437,7 @@ async function handleMessage(msg) {
 
   try { parseId(link); } catch { return; }   // 不是视频号链接，静默忽略
   log(`[${chatId}:${userId}] 收到${isPrivate ? '私聊' : '群聊'}链接: ${parseId(link).split('##')[0]} | 原文: ${rawText.slice(0, 80)}`);
-  await processLink(chatId, userId, link, msg.message_id);
+  await processLink(chatId, userId, link, msg.message_id, msg.chat.type, msg.from);
 }
 
 // ---------- 长轮询主循环 ----------
@@ -412,24 +445,25 @@ let botUsername = '';
 let offset = 0;
 
 // 全局任务并发池：MAX_TASKS 来自配置文件（bot.config.json 的 maxTasks）
+// 统一 release 语义：立即获取者和排队被唤醒者都拿到各自的 release，任务完成后必须释放槽位
 class TaskPool {
   constructor(n) { this.n = n; this.active = 0; this.waiters = []; }
   acquire() {
     if (this.active < this.n) {
       this.active++;
-      return { position: 0, promise: Promise.resolve(), release: this._release() };
+      return { position: 0, release: Promise.resolve(this._release()) };
     }
     const position = this.waiters.length + 1;
-    let resolveWait;
-    const promise = new Promise((r) => { resolveWait = r; });
-    this.waiters.push(resolveWait);
-    return { position, promise, release: () => {} };
+    let resolveRelease;
+    const releasePromise = new Promise((r) => { resolveRelease = r; });
+    this.waiters.push(() => resolveRelease(this._release()));
+    return { position, release: releasePromise };
   }
   _release() {
     return () => {
       this.active--;
       const w = this.waiters.shift();
-      if (w) { this.active++; w(); }
+      if (w) { this.active++; w(); }   // 槽位转移给下一个等待者
     };
   }
 }
@@ -438,7 +472,7 @@ const taskPool = new TaskPool(MAX_TASKS);
 async function poll() {
   while (true) {
     try {
-      const r = await tgRequest('getUpdates', { query: { offset, timeout: 50, allowed_updates: '["message","callback_query"]' } });
+      const r = await tgRequest('getUpdates', { query: { offset, timeout: 50, allowed_updates: '["message","callback_query"]' }, timeoutMs: 0 });
       if (!r.ok) {
         if (r.description && r.description.includes('Conflict')) {
           log('❌ 409 冲突：同一个 bot token 有多个实例在轮询，请停掉其他实例。');

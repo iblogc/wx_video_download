@@ -68,6 +68,10 @@ export function startMockTelegram(port) {
             }
             const rm = text.match(/name="reply_to_message_id"\r\n\r\n([^\r]+)/);
             stats.videoReplyTo = rm ? rm[1] : null;
+            const cap = text.match(/name="caption"\r\n\r\n([^\r]+)/);
+            stats.videoCaption = cap ? cap[1] : null;
+            const ents = text.match(/name="caption_entities"\r\n\r\n([^\r]+)/);
+            stats.videoCaptionEntities = ents ? ents[1] : null;
           } else {
             stats.documents++;
           }
