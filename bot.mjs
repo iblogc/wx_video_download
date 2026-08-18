@@ -253,6 +253,8 @@ async function processLink(chatId, userId, link, replyToMsgId) {
 
   // 进入全局任务池（并发上限 MAX_TASKS，超限回复排队位置）
   const slot = await taskPool.acquire();
+  if (slot.position > 0) log(`[${chatId}:${userId}] 任务进入池: 排队第 ${slot.position} 位（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+  else log(`[${chatId}:${userId}] 任务进入池: 立即执行（活跃 ${taskPool.active}/${MAX_TASKS}）`);
   try {
     if (slot.position > 0) await status(`⏳ 当前任务较多，已排队（第 ${slot.position} 位）...`);
     await slot.promise;
@@ -262,9 +264,12 @@ async function processLink(chatId, userId, link, replyToMsgId) {
       await status('🔄 正在解析...');
       id = parseId(link);
       shortCode = id.split('##')[0];
+      const t0 = Date.now();
       info = await resolveOrFake(id);
+      log(`[${chatId}:${userId}] 解析成功: ${info.title} | ${(info.fileSize / 1048576).toFixed(1)} MB | ${Date.now() - t0}ms`);
     } catch (e) {
       await status('❌ 解析失败: ' + e.message.slice(0, 200));
+      log(`[${chatId}:${userId}] ❌ 解析失败: ${e.message}`);
       return;   // 失败保留错误消息（不删除）
     }
 
@@ -276,10 +281,11 @@ async function processLink(chatId, userId, link, replyToMsgId) {
     if (cacheFileExists(entry)) {
       // 缓存命中：直接复用，不重复下载
       filePath = cachePathOf(entry);
-      log(`[${userId}] 命中缓存: ${entry.file}`);
+      log(`[${chatId}:${userId}] 缓存命中: ${entry.file}`);
     } else {
       // 未命中：下载（文件名用 wx 独占创建原子分配，并发不冲突）
       await status(`⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
+      const dlT0 = Date.now();
       try {
         await dedupe(shortCode, async () => {
           // 等待者进入时第一个可能已完成，再查一次
@@ -303,8 +309,10 @@ async function processLink(chatId, userId, link, replyToMsgId) {
         // 权威路径以缓存为准（并发等待者可能由他人完成下载）
         const fin = loadCache()[shortCode];
         if (fin) filePath = cachePathOf(fin);
+        log(`[${chatId}:${userId}] 下载完成: ${path.basename(filePath)} | ${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB | ${Date.now() - dlT0}ms`);
       } catch (e) {
         await status('❌ 下载失败: ' + e.message.slice(0, 200));
+        log(`[${chatId}:${userId}] ❌ 下载失败: ${e.message}`);
         return;
       }
     }
@@ -324,12 +332,14 @@ async function processLink(chatId, userId, link, replyToMsgId) {
     // 视频上传完成后再清理进度消息，避免用户看到"空白期"
     await status('⬆️ 正在上传...');
     await sendChatAction(chatId, 'upload_video');
+    const upT0 = Date.now();
     try {
       await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId));
       await statusDone();
-      log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
+      log(`[${chatId}:${userId}] 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
     } catch (e) {
       await status('❌ 上传失败: ' + e.message.slice(0, 200));
+      log(`[${chatId}:${userId}] ❌ 上传失败: ${e.message}`);
     }
   } finally {
     slot.release();
@@ -340,23 +350,30 @@ async function handleCallback(query) {
   const data = query.data || '';
   if (!data.startsWith('orig_')) return;
   const shortId = data.slice(5);
+  const chatId = query.message ? query.message.chat.id : null;
+  const userId = query.from ? query.from.id : null;
   const meta = loadGlobalMeta();
   const rec = meta[shortId];
   if (!rec) {
+    log(`[${chatId}:${userId}] 原文件按钮: 记录缺失 shortId=${shortId}`);
     await answerCallback(query.id, '原文件已过期或已被清理');
     return;
   }
   const filePath = path.join(DOWNLOADS_DIR, rec.file);
   if (!fs.existsSync(filePath)) {
+    log(`[${chatId}:${userId}] 原文件按钮: 文件不存在 ${rec.file}`);
     await answerCallback(query.id, '文件已不存在');
     return;
   }
+  log(`[${chatId}:${userId}] 原文件按钮: ${rec.file} (${(rec.size / 1048576).toFixed(1)} MB)`);
   await answerCallback(query.id, '正在发送原文件...');
   try {
-    await sendChatAction(query.message.chat.id, 'upload_document');
-    await tgWithRetry(() => sendDocumentFile(query.message.chat.id, filePath));
+    await sendChatAction(chatId, 'upload_document');
+    await tgWithRetry(() => sendDocumentFile(chatId, filePath));
+    log(`[${chatId}:${userId}] 原文件发送成功: ${rec.file}`);
   } catch (e) {
-    await sendMessage(query.message.chat.id, '❌ 原文件发送失败: ' + e.message.slice(0, 200));
+    await sendMessage(chatId, '❌ 原文件发送失败: ' + e.message.slice(0, 200));
+    log(`[${chatId}:${userId}] ❌ 原文件发送失败: ${e.message}`);
   }
 }
 
@@ -369,6 +386,7 @@ async function handleMessage(msg) {
   const cfg = loadConfig();
   const allowed = cfg.allowedUsers;
   if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(userId)) {
+    log(`[${chatId}:${userId}] 拒绝: 不在白名单 ${JSON.stringify(allowed)}`);
     await sendMessage(chatId, '❌ 该机器人仅限指定用户使用。');
     return;
   }
@@ -385,6 +403,7 @@ async function handleMessage(msg) {
   if (!link) return;
 
   try { parseId(link); } catch { return; }   // 不是视频号链接，静默忽略
+  log(`[${chatId}:${userId}] 收到${isPrivate ? '私聊' : '群聊'}链接: ${parseId(link).split('##')[0]} | 原文: ${rawText.slice(0, 80)}`);
   await processLink(chatId, userId, link, msg.message_id);
 }
 
