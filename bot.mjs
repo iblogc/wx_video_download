@@ -188,6 +188,14 @@ function cacheFileExists(entry) {
   return !!(p && fs.existsSync(p) && fs.statSync(p).size > 0);
 }
 
+// 索引文件（cache.json / meta.json）读改写串行化，避免并发丢失条目
+let ioChain = Promise.resolve();
+function withIoLock(fn) {
+  const run = ioChain.then(fn, fn);
+  ioChain = run.catch(() => {});
+  return run;
+}
+
 // 同一短码的在途下载去重：并发请求共享同一次下载
 const inFlight = new Map();
 function dedupe(key, fn) {
@@ -220,23 +228,27 @@ async function processLink(chatId, userId, link) {
     filePath = cachePathOf(entry);
     log(`[${userId}] 命中缓存: ${entry.file}`);
   } else {
-    // 未命中：确定不冲突的文件名（平铺于 downloads/ 根，重名自动加序号）
-    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-    const used = new Set(fs.readdirSync(DOWNLOADS_DIR));
-    let file = base + '.mp4', n = 2;
-    while (used.has(file)) file = `${base} (${n++}).mp4`;
-    filePath = path.join(DOWNLOADS_DIR, file);
-
+    // 未命中：下载（文件名用 wx 独占创建原子分配，并发不冲突）
     await sendMessage(chatId, `⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
     try {
       await dedupe(shortCode, async () => {
         // 等待者进入时第一个可能已完成，再查一次
-        const c = loadCache();
-        if (cacheFileExists(c[shortCode])) return;
+        if (cacheFileExists(loadCache()[shortCode])) return;
+        fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+        const base2 = base;
+        let file = base2 + '.mp4', n = 2, fd = null;
+        for (;;) {   // 独占创建，已存在则换序号
+          try { fd = fs.openSync(path.join(DOWNLOADS_DIR, file), 'wx'); break; }
+          catch (e) { if (e.code === 'EEXIST') { file = `${base2} (${n++}).mp4`; continue; } throw e; }
+        }
+        fs.closeSync(fd);
         await dlSem.acquire();
-        try { await downloadVideo(info, filePath); } finally { dlSem.release(); }
-        c[shortCode] = { file, size: info.fileSize };
-        saveCache(c);
+        try { await downloadVideo(info, path.join(DOWNLOADS_DIR, file)); } finally { dlSem.release(); }
+        await withIoLock(() => {
+          const c = loadCache();
+          c[shortCode] = { file, size: info.fileSize };
+          saveCache(c);
+        });
       });
       // 权威路径以缓存为准（并发等待者可能由他人完成下载）
       const fin = loadCache()[shortCode];
@@ -253,9 +265,11 @@ async function processLink(chatId, userId, link) {
   }
 
   const shortId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const meta = loadGlobalMeta();
-  meta[shortId] = { file: path.basename(filePath), size: info.fileSize };
-  saveGlobalMeta(meta);
+  await withIoLock(() => {
+    const meta = loadGlobalMeta();
+    meta[shortId] = { file: path.basename(filePath), size: info.fileSize };
+    saveGlobalMeta(meta);
+  });
 
   try {
     await sendChatAction(chatId, 'upload_video');
@@ -321,7 +335,16 @@ async function handleMessage(msg) {
 // ---------- 长轮询主循环 ----------
 let botUsername = '';
 let offset = 0;
-let processing = new Map();   // chatId -> 是否在处理中，避免同一用户并发轰炸
+// 每 chat 一个串行队列：同一用户/群的消息按序处理，不同 chat 并行
+const chatQueues = new Map();
+function enqueue(chatId, task) {
+  const prev = chatQueues.get(chatId) || Promise.resolve();
+  const next = prev.then(task, task);            // 前一个失败不阻塞后续
+  const guard = next.catch(() => {});
+  chatQueues.set(chatId, guard);
+  guard.finally(() => { if (chatQueues.get(chatId) === guard) chatQueues.delete(chatId); });
+  return next;
+}
 
 async function poll() {
   while (true) {
@@ -339,12 +362,11 @@ async function poll() {
       for (const u of r.result) {
         offset = Math.max(offset, u.update_id + 1);
         if (u.message) {
-          const key = u.message.chat.id;
-          if (processing.has(key)) continue;
-          processing.set(key, true);
-          handleMessage(u.message).catch((e) => log('处理消息出错:', e.message)).finally(() => processing.delete(key));
+          enqueue(u.message.chat.id, () => handleMessage(u.message).catch((e) => log('处理消息出错:', e.message)));
         } else if (u.callback_query) {
-          handleCallback(u.callback_query).catch((e) => log('处理回调出错:', e.message));
+          const cid = u.callback_query.message ? u.callback_query.message.chat.id : null;
+          const task = () => handleCallback(u.callback_query).catch((e) => log('处理回调出错:', e.message));
+          if (cid != null) enqueue(cid, task); else task();
         }
       }
     } catch (e) {
