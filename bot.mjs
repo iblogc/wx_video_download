@@ -313,14 +313,15 @@ async function processLink(chatId, userId, link) {
       saveGlobalMeta(meta);
     });
 
-    // 发送前清理中间进度消息，只留最终视频
-    await statusDone();
+    // 视频上传完成后再清理进度消息，避免用户看到"空白期"
+    await status('⬆️ 正在上传...');
     await sendChatAction(chatId, 'upload_video');
     try {
       await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize));
+      await statusDone();
       log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
     } catch (e) {
-      await sendMessage(chatId, '❌ 上传失败: ' + e.message.slice(0, 200));
+      await status('❌ 上传失败: ' + e.message.slice(0, 200));
     }
   } finally {
     slot.release();

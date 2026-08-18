@@ -41,6 +41,7 @@ export function startMockTelegram(port) {
         return res.end(JSON.stringify({ ok: true, result: { message_id: +url.searchParams.get('message_id') } }));
       case 'deleteMessage':
         stats.deletes++;
+        stats.deletesAfterVideos = stats.videos;   // 删除时刻已发出的视频数（验证先发后删）
         return res.end(JSON.stringify({ ok: true, result: true }));
       case 'sendChatAction':
         stats.actions.push(url.searchParams.get('action'));
