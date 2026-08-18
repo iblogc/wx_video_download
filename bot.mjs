@@ -127,13 +127,13 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId) {
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize) {
   const data = fs.readFileSync(filePath);
   const { body, contentType } = buildMultipart({
     chat_id: String(chatId),
     video: data,
     supports_streaming: 'true',
-    reply_markup: JSON.stringify({ inline_keyboard: [[{ text: '📥 获取原文件（不压缩）', callback_data: 'orig_' + shortId }]] }),
+    reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
   });
   return tgRequest('sendVideo', { body, headers: { 'content-type': contentType } });
 }
@@ -216,81 +216,114 @@ async function resolveOrFake(id) {
   return resolveVideo(id);
 }
 async function downloadOrFake(info, filePath) {
-  if (FAKE) { fs.writeFileSync(filePath, Buffer.alloc(1024 * 512, 7)); return 1024 * 512; }
+  if (FAKE) {
+    const delay = parseInt(process.env.FAKE_DELAY || '0', 10);   // 测试排队场景时模拟慢下载
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    fs.writeFileSync(filePath, Buffer.alloc(1024 * 512, 7));
+    return 1024 * 512;
+  }
   return downloadVideo(info, filePath);
 }
 
 async function processLink(chatId, userId, link) {
-  let info, id, shortCode;
+  // 进度消息：首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
+  let statusMsgId = null;
+  const status = async (text) => {
+    if (statusMsgId == null) {
+      const r = await tgRequest('sendMessage', { query: { chat_id: chatId, text } });
+      statusMsgId = r.ok ? r.result.message_id : null;
+    } else {
+      await tgRequest('editMessageText', { query: { chat_id: chatId, message_id: statusMsgId, text } }).catch(() => {});
+    }
+  };
+  const statusDone = async () => {
+    if (statusMsgId != null) {
+      await tgRequest('deleteMessage', { query: { chat_id: chatId, message_id: statusMsgId } }).catch(() => {});
+      statusMsgId = null;
+    }
+  };
+
+  // 进入全局任务池（并发上限 MAX_TASKS，超限回复排队位置）
+  const slot = await taskPool.acquire();
   try {
-    await sendMessage(chatId, '🔄 正在解析...');
-    id = parseId(link);
-    shortCode = id.split('##')[0];
-    info = await resolveOrFake(id);
-  } catch (e) {
-    await sendMessage(chatId, '❌ 解析失败: ' + e.message.slice(0, 200));
-    return;
-  }
+    if (slot.position > 0) await status(`⏳ 当前任务较多，已排队（第 ${slot.position} 位）...`);
+    await slot.promise;
 
-  const base = cleanTitle(info.title, 'video');
-  const cache = loadCache();
-  const entry = cache[shortCode];
-
-  let filePath;
-  if (cacheFileExists(entry)) {
-    // 缓存命中：直接复用，不重复下载
-    filePath = cachePathOf(entry);
-    log(`[${userId}] 命中缓存: ${entry.file}`);
-  } else {
-    // 未命中：下载（文件名用 wx 独占创建原子分配，并发不冲突）
-    await sendMessage(chatId, `⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
+    let info, id, shortCode;
     try {
-      await dedupe(shortCode, async () => {
-        // 等待者进入时第一个可能已完成，再查一次
-        if (cacheFileExists(loadCache()[shortCode])) return;
-        fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-        const base2 = base;
-        let file = base2 + '.mp4', n = 2, fd = null;
-        for (;;) {   // 独占创建，已存在则换序号
-          try { fd = fs.openSync(path.join(DOWNLOADS_DIR, file), 'wx'); break; }
-          catch (e) { if (e.code === 'EEXIST') { file = `${base2} (${n++}).mp4`; continue; } throw e; }
-        }
-        fs.closeSync(fd);
-        await dlSem.acquire();
-        try { await downloadOrFake(info, path.join(DOWNLOADS_DIR, file)); } finally { dlSem.release(); }
-        await withIoLock(() => {
-          const c = loadCache();
-          c[shortCode] = { file, size: info.fileSize };
-          saveCache(c);
-        });
-      });
-      // 权威路径以缓存为准（并发等待者可能由他人完成下载）
-      const fin = loadCache()[shortCode];
-      if (fin) filePath = cachePathOf(fin);
+      await status('🔄 正在解析...');
+      id = parseId(link);
+      shortCode = id.split('##')[0];
+      info = await resolveOrFake(id);
     } catch (e) {
-      await sendMessage(chatId, '❌ 下载失败: ' + e.message.slice(0, 200));
+      await status('❌ 解析失败: ' + e.message.slice(0, 200));
+      return;   // 失败保留错误消息（不删除）
+    }
+
+    const base = cleanTitle(info.title, 'video');
+    const cache = loadCache();
+    const entry = cache[shortCode];
+
+    let filePath;
+    if (cacheFileExists(entry)) {
+      // 缓存命中：直接复用，不重复下载
+      filePath = cachePathOf(entry);
+      log(`[${userId}] 命中缓存: ${entry.file}`);
+    } else {
+      // 未命中：下载（文件名用 wx 独占创建原子分配，并发不冲突）
+      await status(`⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
+      try {
+        await dedupe(shortCode, async () => {
+          // 等待者进入时第一个可能已完成，再查一次
+          if (cacheFileExists(loadCache()[shortCode])) return;
+          fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+          const base2 = base;
+          let file = base2 + '.mp4', n = 2, fd = null;
+          for (;;) {   // 独占创建，已存在则换序号
+            try { fd = fs.openSync(path.join(DOWNLOADS_DIR, file), 'wx'); break; }
+            catch (e) { if (e.code === 'EEXIST') { file = `${base2} (${n++}).mp4`; continue; } throw e; }
+          }
+          fs.closeSync(fd);
+          await dlSem.acquire();
+          try { await downloadOrFake(info, path.join(DOWNLOADS_DIR, file)); } finally { dlSem.release(); }
+          await withIoLock(() => {
+            const c = loadCache();
+            c[shortCode] = { file, size: info.fileSize };
+            saveCache(c);
+          });
+        });
+        // 权威路径以缓存为准（并发等待者可能由他人完成下载）
+        const fin = loadCache()[shortCode];
+        if (fin) filePath = cachePathOf(fin);
+      } catch (e) {
+        await status('❌ 下载失败: ' + e.message.slice(0, 200));
+        return;
+      }
+    }
+
+    if (info.fileSize > MAX_UPLOAD) {
+      await status(`⚠️ 视频 ${(info.fileSize / 1048576).toFixed(1)} MB 超过 Telegram 50MB 上限，无法发送。已保存到本机 downloads/${path.basename(filePath)}。`);
       return;
     }
-  }
 
-  if (info.fileSize > MAX_UPLOAD) {
-    await sendMessage(chatId, `⚠️ 视频 ${(info.fileSize / 1048576).toFixed(1)} MB 超过 Telegram 50MB 上限，无法发送。已保存到本机 downloads/${path.basename(filePath)}。`);
-    return;
-  }
+    const shortId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    await withIoLock(() => {
+      const meta = loadGlobalMeta();
+      meta[shortId] = { file: path.basename(filePath), size: info.fileSize };
+      saveGlobalMeta(meta);
+    });
 
-  const shortId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  await withIoLock(() => {
-    const meta = loadGlobalMeta();
-    meta[shortId] = { file: path.basename(filePath), size: info.fileSize };
-    saveGlobalMeta(meta);
-  });
-
-  try {
+    // 发送前清理中间进度消息，只留最终视频
+    await statusDone();
     await sendChatAction(chatId, 'upload_video');
-    await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId));
-    log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
-  } catch (e) {
-    await sendMessage(chatId, '❌ 上传失败: ' + e.message.slice(0, 200));
+    try {
+      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize));
+      log(`[${userId}] 发送成功: ${path.basename(filePath)}`);
+    } catch (e) {
+      await sendMessage(chatId, '❌ 上传失败: ' + e.message.slice(0, 200));
+    }
+  } finally {
+    slot.release();
   }
 }
 
@@ -349,16 +382,31 @@ async function handleMessage(msg) {
 // ---------- 长轮询主循环 ----------
 let botUsername = '';
 let offset = 0;
-// 每 chat 一个串行队列：同一用户/群的消息按序处理，不同 chat 并行
-const chatQueues = new Map();
-function enqueue(chatId, task) {
-  const prev = chatQueues.get(chatId) || Promise.resolve();
-  const next = prev.then(task, task);            // 前一个失败不阻塞后续
-  const guard = next.catch(() => {});
-  chatQueues.set(chatId, guard);
-  guard.finally(() => { if (chatQueues.get(chatId) === guard) chatQueues.delete(chatId); });
-  return next;
+
+// 全局任务并发池：MAX_TASKS 可配上限；达到上限时新任务回复排队位置
+const MAX_TASKS = parseInt(process.env.MAX_TASKS || '5', 10);
+class TaskPool {
+  constructor(n) { this.n = n; this.active = 0; this.waiters = []; }
+  acquire() {
+    if (this.active < this.n) {
+      this.active++;
+      return { position: 0, promise: Promise.resolve(), release: this._release() };
+    }
+    const position = this.waiters.length + 1;
+    let resolveWait;
+    const promise = new Promise((r) => { resolveWait = r; });
+    this.waiters.push(resolveWait);
+    return { position, promise, release: () => {} };
+  }
+  _release() {
+    return () => {
+      this.active--;
+      const w = this.waiters.shift();
+      if (w) { this.active++; w(); }
+    };
+  }
 }
+const taskPool = new TaskPool(MAX_TASKS);
 
 async function poll() {
   while (true) {
@@ -376,11 +424,9 @@ async function poll() {
       for (const u of r.result) {
         offset = Math.max(offset, u.update_id + 1);
         if (u.message) {
-          enqueue(u.message.chat.id, () => handleMessage(u.message).catch((e) => log('处理消息出错:', e.message)));
+          handleMessage(u.message).catch((e) => log('处理消息出错:', e.message));
         } else if (u.callback_query) {
-          const cid = u.callback_query.message ? u.callback_query.message.chat.id : null;
-          const task = () => handleCallback(u.callback_query).catch((e) => log('处理回调出错:', e.message));
-          if (cid != null) enqueue(cid, task); else task();
+          handleCallback(u.callback_query).catch((e) => log('处理回调出错:', e.message));
         }
       }
     } catch (e) {
