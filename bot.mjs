@@ -27,30 +27,34 @@ import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { parseId, resolveVideo, downloadVideo, cleanTitle } from './lib.mjs';
 
-const TOKEN = process.env.TG_BOT_TOKEN;
 const TG_BASE = process.env.TEST_TG_BASE || 'https://api.telegram.org';
 const MAX_UPLOAD = 50 * 1024 * 1024;                                  // Telegram 上传上限 50MB
 const MAX_CONCURRENT_DOWNLOADS = 3;
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-// 数据目录可配置：DOWNLOAD_DIR 覆盖（测试用），默认 ~/Downloads/wx-videos
-const DOWNLOADS_DIR = process.env.DOWNLOAD_DIR || path.join(os.homedir(), 'Downloads', 'wx-videos');
 const CONFIG_PATH = process.env.BOT_CONFIG || path.join(DIR, 'bot.config.json');
-const GLOBAL_META = path.join(DOWNLOADS_DIR, 'meta.json');
 // FAKE_NETWORK=1：测试模式，解析/下载全部走假数据（离线、毫秒级、零真实文件）
 const FAKE = process.env.FAKE_NETWORK === '1';
 
+// 统一配置文件（bot.config.json），字段见 bot.config.example.json
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
+}
+const config = loadConfig();
+const TOKEN = config.token || '';
+const DOWNLOADS_DIR = config.downloadDir
+  ? config.downloadDir.replace(/^~(?=\/|$)/, os.homedir())
+  : path.join(os.homedir(), 'Downloads', 'wx-videos');
+const MAX_TASKS = parseInt(config.maxTasks || '5', 10);
+const GLOBAL_META = path.join(DOWNLOADS_DIR, 'meta.json');
+
 if (!TOKEN) {
-  console.error('缺少 TG_BOT_TOKEN 环境变量，请先设置（见文件头注释）。');
+  console.error('❌ bot.config.json 里未配置 token（用 @BotFather 创建机器人获取，见 bot.config.example.json）。');
   process.exit(1);
 }
 
 // ---------- 工具 ----------
 const tzFmt = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const log = (...a) => console.log(tzFmt.format(new Date()), ...a);
-
-function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
-}
 
 function loadGlobalMeta() {
   try { return JSON.parse(fs.readFileSync(GLOBAL_META, 'utf8')); } catch { return {}; }
@@ -60,8 +64,11 @@ function saveGlobalMeta(m) {
   fs.writeFileSync(GLOBAL_META, JSON.stringify(m, null, 2));
 }
 
-// ---------- 代理（仅 Telegram API 使用） ----------
+// ---------- 代理（仅 Telegram API 使用）：配置优先，缺省读环境变量 ----------
 function parseProxy() {
+  if (config.proxy && config.proxy.host) {
+    return { host: config.proxy.host, port: config.proxy.port ? +config.proxy.port : 80 };
+  }
   const v = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
   if (!v) return null;
   try { const u = new URL(v); return { host: u.hostname, port: u.port ? +u.port : 80 }; } catch { return null; }
@@ -384,8 +391,7 @@ async function handleMessage(msg) {
 let botUsername = '';
 let offset = 0;
 
-// 全局任务并发池：MAX_TASKS 可配上限；达到上限时新任务回复排队位置
-const MAX_TASKS = parseInt(process.env.MAX_TASKS || '5', 10);
+// 全局任务并发池：MAX_TASKS 来自配置文件（bot.config.json 的 maxTasks）
 class TaskPool {
   constructor(n) { this.n = n; this.active = 0; this.waiters = []; }
   acquire() {

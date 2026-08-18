@@ -85,15 +85,14 @@ export function startMockTelegram(port) {
   };
 }
 
-export function spawnBot(port, { extraEnv = {} } = {}) {
+export function spawnBot(port, { extraEnv = {}, config = {} } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wxbot-test-'));
   const dl = path.join(tmp, 'dl');
   const cfg = path.join(tmp, 'config.json');
+  fs.writeFileSync(cfg, JSON.stringify({ token: 'mocktoken', downloadDir: dl, maxTasks: 5, ...config }));
   const env = {
     ...process.env,
-    TG_BOT_TOKEN: 'mocktoken',
     TEST_TG_BASE: 'http://127.0.0.1:' + port,
-    DOWNLOAD_DIR: dl,
     BOT_CONFIG: cfg,
     FAKE_NETWORK: '1',
     http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '',

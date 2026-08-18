@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # 微信视频下载机器人管理脚本
-# 用法: ./bot.sh {start|stop|restart|status}
-# 首次使用: echo '你的TG_BOT_TOKEN' > bot.env   （token 存在这里，不留在命令历史里）
+# 用法: ./bot.sh {start|stop|restart|status|log}
+# 配置统一在 bot.config.json（token/downloadDir/maxTasks/allowedUsers/proxy，见 bot.config.example.json）
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT="$DIR/bot.mjs"
 LOG="$DIR/bot.log"
 PID_FILE="$DIR/bot.pid"
-TOKEN="${TG_BOT_TOKEN:-$( [ -f "$DIR/bot.env" ] && cat "$DIR/bot.env" )}"
+CONFIG="$DIR/bot.config.json"
 
 start() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "已在运行 (PID $(cat "$PID_FILE"))"
     return 0
   fi
-  if [ -z "$TOKEN" ]; then
-    echo "错误: 未设置 TG_BOT_TOKEN，且没有 bot.env"
-    echo "  首次使用: echo '你的token' > bot.env"
+  if [ ! -f "$CONFIG" ] || ! grep -q '"token"' "$CONFIG" 2>/dev/null; then
+    echo "错误: $CONFIG 里未配置 token"
+    echo "  参考: cp bot.config.example.json bot.config.json 并填入你的 token"
     exit 1
   fi
-  TG_BOT_TOKEN="$TOKEN" nohup node "$BOT" > "$LOG" 2>&1 &
+  nohup node "$BOT" > "$LOG" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
   echo "已启动 (PID $(cat "$PID_FILE"))  日志: $LOG"

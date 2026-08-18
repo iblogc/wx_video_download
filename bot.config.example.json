@@ -1,0 +1,7 @@
+{
+  "token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+  "downloadDir": "~/Downloads/wx-videos",
+  "maxTasks": 5,
+  "allowedUsers": [],
+  "proxy": { "host": "127.0.0.1", "port": 1080 }
+}

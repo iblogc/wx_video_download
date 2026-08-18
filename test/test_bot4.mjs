@@ -15,7 +15,7 @@ import { startMockTelegram, spawnBot, waitFor } from './helpers.mjs';
   await mock.listen();
   mock.push({ update_id: 1, message: { message_id: 1, chat: { id: 111, type: 'private' }, from: { id: 111 }, text: 'https://weixin.qq.com/sph/AAAA111111' } });
   mock.push({ update_id: 2, message: { message_id: 2, chat: { id: 222, type: 'private' }, from: { id: 222 }, text: 'https://weixin.qq.com/sph/BBBB222222' } });
-  const bot = spawnBot(PORT, { extraEnv: { MAX_TASKS: '1', FAKE_DELAY: '1500' } });
+  const bot = spawnBot(PORT, { config: { maxTasks: 1 }, extraEnv: { FAKE_DELAY: '1500' } });
 
   const queued = await waitFor(() => mock.stats.texts.some((t) => t.text.includes('已排队')));
   const bothDone = await waitFor(() => mock.stats.videos >= 2);

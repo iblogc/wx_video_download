@@ -20,18 +20,18 @@ wx-video/
 ├── lib.mjs            # 解析/下载核心（链接解析、签名、CDN 下载、XOR 还原）
 ├── wxdl.mjs           # 命令行下载工具
 ├── bot.sh             # 管理脚本（启动/停止/重启/状态/日志）
-├── bot.config.json    # 白名单配置（{} = 所有人可用）
-├── bot.env            # Bot token（首次运行配置，勿提交到 git）
+├── bot.config.json    # 配置（token/目录/并发/白名单/代理，不入库）
+├── bot.config.example.json  # 配置模板
 └── test/              # mock Telegram 端到端测试（完全离线）
 ```
 
 ## 快速开始
 
 1. **获取 token**：Telegram 里找 [@BotFather](https://t.me/BotFather) → `/newbot` → 按提示创建，拿到 token
-2. **配置 token**：
+2. **配置**：复制模板并填入 token：
    ```bash
    cd wx-video
-   echo '你的bot_token' > bot.env && chmod 600 bot.env
+   cp bot.config.example.json bot.config.json   # 编辑填入你的 token
    ```
 3. **启动**：
    ```bash
@@ -42,24 +42,24 @@ wx-video/
    ./bot.sh stop       # 停止
    ```
 
-> 网络要求：Telegram API 走本机代理（自动读取 `http_proxy`/`https_proxy` 环境变量），视频下载走直连。
+> 网络要求：Telegram API 走代理（配置文件 `proxy` 字段优先，缺省读 `http_proxy`/`https_proxy` 环境变量），视频下载走直连。
 
-## 配置
+## 配置（bot.config.json）
 
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `TG_BOT_TOKEN` | 必填（或 `bot.env`） | Bot token |
-| `DOWNLOAD_DIR` | `~/Downloads/wx-videos` | 视频存储目录 |
-| `MAX_TASKS` | `5` | 同时处理的任务数上限 |
-| `BOT_CONFIG` | `./bot.config.json` | 白名单配置路径 |
-
-**白名单**（可选）：`bot.config.json` 写入：
+所有配置集中在 `bot.config.json`（含 token，已加入 .gitignore 不入库）：
 
 ```json
-{ "allowedUsers": [123456789, 987654321] }
+{
+  "token": "123456:ABC-DEF...",          // @BotFather 获取（必填）
+  "downloadDir": "~/Downloads/wx-videos", // 视频存储目录
+  "maxTasks": 5,                          // 同时处理的任务数上限
+  "allowedUsers": [],                     // 白名单（空 = 所有人可用）
+  "proxy": { "host": "127.0.0.1", "port": 1080 }   // 代理（可删，删后读环境变量）
+}
 ```
 
-留空或 `{}` = 所有人可用。修改即时生效，无需重启。
+- `allowedUsers` 修改**即时生效**，无需重启；其余字段重启生效
+- 白名单示例：`"allowedUsers": [123456789, 987654321]`
 
 ## 使用方式
 
