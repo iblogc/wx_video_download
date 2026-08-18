@@ -160,7 +160,7 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention) {
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention, title) {
   const data = fs.readFileSync(filePath);
   const fields = {
     chat_id: String(chatId),
@@ -169,7 +169,18 @@ async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToM
     supports_streaming: 'true',
     reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
   };
-  if (mention) {   // 群聊：@ 原消息发送人，触发提醒
+  // 视频标题（单行化）+ 群聊时 @ 原消息发送人
+  const cap = title ? String(title).replace(/\s*\n+\s*/g, ' ').trim().slice(0, 1024) : '';
+  if (cap) {
+    if (mention && mention.type === 'username') {
+      fields.caption = `${cap}\n${mention.value}`;
+    } else if (mention && mention.type === 'text_mention') {
+      fields.caption = `${cap}\n${mention.value}`;
+      fields.caption_entities = JSON.stringify([{ type: 'text_mention', offset: cap.length + 1, length: mention.value.length, user: { id: mention.userId } }]);
+    } else {
+      fields.caption = cap;
+    }
+  } else if (mention) {   // 无标题时的兜底（保留纯 @）
     if (mention.type === 'username') {
       fields.caption = mention.value;
     } else {
@@ -391,7 +402,7 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from, w
     await sendChatAction(chatId, 'upload_video');
     const upT0 = Date.now();
     try {
-      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from)));
+      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from), info.title));
       await statusDone();
       log(`${who} 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
     } catch (e) {
