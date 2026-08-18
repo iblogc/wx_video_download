@@ -144,6 +144,10 @@ function buildMultipart(fields) {
     if (v instanceof Buffer) {
       chunks.push(Buffer.from(`; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
       chunks.push(v, Buffer.from('\r\n'));
+    } else if (v && typeof v === 'object' && v.data instanceof Buffer) {
+      // 文件字段支持指定文件名: { data: Buffer, filename: 'xxx.mp4', contentType?: 'video/mp4' }
+      chunks.push(Buffer.from(`; filename="${v.filename || name}"\r\nContent-Type: ${v.contentType || 'application/octet-stream'}\r\n\r\n`));
+      chunks.push(v.data, Buffer.from('\r\n'));
     } else {
       chunks.push(Buffer.from(`\r\n\r\n${v}\r\n`));
     }
@@ -161,7 +165,7 @@ async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToM
   const fields = {
     chat_id: String(chatId),
     reply_to_message_id: String(replyToMsgId || ''),
-    video: data,
+    video: { data, filename: path.basename(filePath), contentType: 'video/mp4' },
     supports_streaming: 'true',
     reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
   };
@@ -181,7 +185,7 @@ async function sendDocumentFile(chatId, filePath) {
   const data = fs.readFileSync(filePath);
   const { body, contentType } = buildMultipart({
     chat_id: String(chatId),
-    document: data,
+    document: { data, filename: path.basename(filePath), contentType: 'video/mp4' },
   });
   return tgRequest('sendDocument', { body, headers: { 'content-type': contentType } });
 }

@@ -74,6 +74,8 @@ export function startMockTelegram(port) {
             stats.videoCaptionEntities = ents ? ents[1] : null;
           } else {
             stats.documents++;
+            const fm = text.match(/name="document"[\s\S]*?filename="([^"]+)"/);
+            stats.documentFilename = fm ? fm[1] : null;
           }
           res.end(JSON.stringify({ ok: true, result: { message_id: ++msgSeq } }));
         });
