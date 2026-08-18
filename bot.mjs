@@ -54,7 +54,27 @@ if (!TOKEN) {
 
 // ---------- 工具 ----------
 const tzFmt = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-const log = (...a) => console.log(tzFmt.format(new Date()), ...a);
+const dayFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });  // en-CA → YYYY-MM-DD
+const LOG_DIR = path.join(DIR, 'logs');
+function dayKey() { return dayFmt.format(new Date()); }
+function writeLog(line) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, `bot-${dayKey()}.log`), line + '\n');
+  } catch {}
+}
+const log = (...a) => {
+  const line = tzFmt.format(new Date()) + ' ' + a.join(' ');
+  console.log(line);
+  writeLog(line);
+};
+
+// 发送人/群描述（日志用）：[群名或私聊(chatId)][昵称(@username, userId)]
+function describeSender(chat, from) {
+  const chatName = chat && chat.title ? String(chat.title) : (chat ? chat.type : '?');
+  const name = from && (from.username ? '@' + from.username : (from.first_name || from.last_name || '')) || (from ? String(from.id) : '?');
+  return `[${chatName}(${chat ? chat.id : '?'})][${name}(${from ? from.id : '?'})]`;
+}
 
 function loadGlobalMeta() {
   try { return JSON.parse(fs.readFileSync(GLOBAL_META, 'utf8')); } catch { return {}; }
@@ -252,7 +272,7 @@ function buildMention(chatType, from) {
   return { type: 'text_mention', value: name, userId: from.id };
 }
 
-async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
+async function processLink(chatId, userId, link, replyToMsgId, chatType, from, who) {
   // 进度消息：reply 到用户消息，首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
   let statusMsgId = null;
   const status = async (text) => {
@@ -273,10 +293,10 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
   // 进入全局任务池（并发上限 MAX_TASKS，超限回复排队位置）
   const slot = await taskPool.acquire();
   if (slot.position > 0) {
-    log(`[${chatId}:${userId}] 任务进入池: 排队第 ${slot.position} 位（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+    log(`${who} 任务进入池: 排队第 ${slot.position} 位（活跃 ${taskPool.active}/${MAX_TASKS}）`);
     await status(`⏳ 当前任务较多，已排队（第 ${slot.position} 位）...`);
   } else {
-    log(`[${chatId}:${userId}] 任务进入池: 立即执行（活跃 ${taskPool.active}/${MAX_TASKS}）`);
+    log(`${who} 任务进入池: 立即执行（活跃 ${taskPool.active}/${MAX_TASKS}）`);
   }
   const release = await slot.release;   // 立即获取者即刻返回；排队者等待空位
   try {
@@ -288,10 +308,10 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
       shortCode = id.split('##')[0];
       const t0 = Date.now();
       info = await resolveOrFake(id);
-      log(`[${chatId}:${userId}] 解析成功: ${info.title} | ${(info.fileSize / 1048576).toFixed(1)} MB | ${Date.now() - t0}ms`);
+      log(`${who} 解析成功: ${info.title} | ${(info.fileSize / 1048576).toFixed(1)} MB | ${Date.now() - t0}ms`);
     } catch (e) {
       await status('❌ 解析失败: ' + e.message.slice(0, 200));
-      log(`[${chatId}:${userId}] ❌ 解析失败: ${e.message}`);
+      log(`${who} ❌ 解析失败: ${e.message}`);
       return;   // 失败保留错误消息（不删除）
     }
 
@@ -303,7 +323,7 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
     if (cacheFileExists(entry)) {
       // 缓存命中：直接复用，不重复下载
       filePath = cachePathOf(entry);
-      log(`[${chatId}:${userId}] 缓存命中: ${entry.file}`);
+      log(`${who} 缓存命中: ${entry.file}`);
     } else {
       // 未命中：下载（文件名用 wx 独占创建原子分配，并发不冲突）
       await status(`⬇️ 正在下载（${(info.fileSize / 1048576).toFixed(1)} MB）...`);
@@ -317,7 +337,7 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
           // 同名文件已存在：先校验是否同一视频（文件字节数一致视为同一，直接复用不重复下载）
           const existPath = path.join(DOWNLOADS_DIR, base2 + '.mp4');
           if (fs.existsSync(existPath) && fs.statSync(existPath).size === info.fileSize) {
-            log(`[${chatId}:${userId}] 同名文件且大小一致（同一视频），直接复用: ${base2}.mp4`);
+            log(`${who} 同名文件且大小一致（同一视频），直接复用: ${base2}.mp4`);
             await withIoLock(() => {
               const c = loadCache();
               c[shortCode] = { file: base2 + '.mp4', size: info.fileSize };
@@ -342,10 +362,10 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
         // 权威路径以缓存为准（并发等待者可能由他人完成下载）
         const fin = loadCache()[shortCode];
         if (fin) filePath = cachePathOf(fin);
-        log(`[${chatId}:${userId}] 下载完成: ${path.basename(filePath)} | ${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB | ${Date.now() - dlT0}ms`);
+        log(`${who} 下载完成: ${path.basename(filePath)} | ${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB | ${Date.now() - dlT0}ms`);
       } catch (e) {
         await status('❌ 下载失败: ' + e.message.slice(0, 200));
-        log(`[${chatId}:${userId}] ❌ 下载失败: ${e.message}`);
+        log(`${who} ❌ 下载失败: ${e.message}`);
         return;
       }
     }
@@ -369,10 +389,10 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from) {
     try {
       await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from)));
       await statusDone();
-      log(`[${chatId}:${userId}] 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
+      log(`${who} 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
     } catch (e) {
       await status('❌ 上传失败: ' + e.message.slice(0, 200));
-      log(`[${chatId}:${userId}] ❌ 上传失败: ${e.message}`);
+      log(`${who} ❌ 上传失败: ${e.message}`);
     }
   } finally {
     release();
@@ -385,41 +405,43 @@ async function handleCallback(query) {
   const shortId = data.slice(5);
   const chatId = query.message ? query.message.chat.id : null;
   const userId = query.from ? query.from.id : null;
+  const who = describeSender(query.message ? query.message.chat : null, query.from);
   const meta = loadGlobalMeta();
   const rec = meta[shortId];
   if (!rec) {
-    log(`[${chatId}:${userId}] 原文件按钮: 记录缺失 shortId=${shortId}`);
+    log(`${who} 原文件按钮: 记录缺失 shortId=${shortId}`);
     await answerCallback(query.id, '原文件已过期或已被清理');
     return;
   }
   const filePath = path.join(DOWNLOADS_DIR, rec.file);
   if (!fs.existsSync(filePath)) {
-    log(`[${chatId}:${userId}] 原文件按钮: 文件不存在 ${rec.file}`);
+    log(`${who} 原文件按钮: 文件不存在 ${rec.file}`);
     await answerCallback(query.id, '文件已不存在');
     return;
   }
-  log(`[${chatId}:${userId}] 原文件按钮: ${rec.file} (${(rec.size / 1048576).toFixed(1)} MB)`);
+  log(`${who} 原文件按钮: ${rec.file} (${(rec.size / 1048576).toFixed(1)} MB)`);
   await answerCallback(query.id, '正在发送原文件...');
   try {
     await sendChatAction(chatId, 'upload_document');
     await tgWithRetry(() => sendDocumentFile(chatId, filePath));
-    log(`[${chatId}:${userId}] 原文件发送成功: ${rec.file}`);
+    log(`${who} 原文件发送成功: ${rec.file}`);
   } catch (e) {
     await sendMessage(chatId, '❌ 原文件发送失败: ' + e.message.slice(0, 200));
-    log(`[${chatId}:${userId}] ❌ 原文件发送失败: ${e.message}`);
+    log(`${who} ❌ 原文件发送失败: ${e.message}`);
   }
 }
 
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  const who = describeSender(msg.chat, msg.from);
   const rawText = (msg.text || '').trim();
   if (!rawText || !msg.from) return;
 
   const cfg = loadConfig();
   const allowed = cfg.allowedUsers;
   if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(userId)) {
-    log(`[${chatId}:${userId}] 拒绝: 不在白名单 ${JSON.stringify(allowed)}`);
+    log(`${who} 拒绝: 不在白名单 ${JSON.stringify(allowed)}`);
     await sendMessage(chatId, '❌ 该机器人仅限指定用户使用。');
     return;
   }
@@ -436,8 +458,8 @@ async function handleMessage(msg) {
   if (!link) return;
 
   try { parseId(link); } catch { return; }   // 不是视频号链接，静默忽略
-  log(`[${chatId}:${userId}] 收到${isPrivate ? '私聊' : '群聊'}链接: ${parseId(link).split('##')[0]} | 原文: ${rawText.slice(0, 80)}`);
-  await processLink(chatId, userId, link, msg.message_id, msg.chat.type, msg.from);
+  log(`${who} 收到${isPrivate ? '私聊' : '群聊'}链接: ${parseId(link).split('##')[0]} | 原文: ${rawText.slice(0, 80)}`);
+  await processLink(chatId, userId, link, msg.message_id, msg.chat.type, msg.from, who);
 }
 
 // ---------- 长轮询主循环 ----------

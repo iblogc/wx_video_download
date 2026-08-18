@@ -5,7 +5,8 @@
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT="$DIR/bot.mjs"
-LOG="$DIR/bot.log"
+LOG_DIR="$DIR/logs"
+LOG_FILE="$LOG_DIR/bot-$(TZ=Asia/Shanghai date +%F).log"
 PID_FILE="$DIR/bot.pid"
 CONFIG="$DIR/bot.config.json"
 
@@ -19,10 +20,12 @@ start() {
     echo "  参考: cp bot.config.example.json bot.config.json 并填入你的 token"
     exit 1
   fi
-  nohup node "$BOT" > "$LOG" 2>&1 &
+  mkdir -p "$LOG_DIR"
+  # bot 内部按天写日志文件（logs/bot-YYYY-MM-DD.log），stdout 仅保留启动错误
+  nohup node "$BOT" > "$LOG_DIR/bot.out" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
-  echo "已启动 (PID $(cat "$PID_FILE"))  日志: $LOG"
+  echo "已启动 (PID $(cat "$PID_FILE"))  日志: $LOG_FILE"
 }
 
 stop() {
@@ -39,18 +42,19 @@ restart() { stop; sleep 1; start; }
 status() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "运行中 (PID $(cat "$PID_FILE"))"
-    [ -f "$LOG" ] && tail -3 "$LOG"
+    [ -f "$LOG_FILE" ] && tail -3 "$LOG_FILE"
   else
     echo "未运行"
   fi
 }
 
 log() {
-  if [ ! -f "$LOG" ]; then
-    echo "暂无日志文件"
+  local f="$LOG_DIR/bot-$(TZ=Asia/Shanghai date +%F).log"
+  if [ ! -f "$f" ]; then
+    echo "今天暂无日志: $f"
     return 1
   fi
-  tail -f "$LOG"
+  tail -f "$f"
 }
 
 case "$1" in

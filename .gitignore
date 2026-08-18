@@ -1,5 +1,7 @@
 bot.env
 bot.log
+logs/
+bot.out
 bot.pid
 downloads/
 bot.config.json

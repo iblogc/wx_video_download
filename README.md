@@ -44,6 +44,15 @@ wx-video/
 
 > 网络要求：Telegram API 走代理（配置文件 `proxy` 字段优先，缺省读 `http_proxy`/`https_proxy` 环境变量），视频下载走直连。
 
+日志**按天持久化**在 `logs/bot-YYYY-MM-DD.log`（东八区日期），`./bot.sh log` 实时查看当天日志。每条日志带发送人/群信息：
+
+```
+[老同学群(-100123456789)][小明(@xiaoming, 123456789)] 收到群聊链接: A9TdAV4DFB | ...
+[老同学群(-100123456789)][小明(@xiaoming, 123456789)] 解析成功: 只爱我一个不好吗？ | 8.3 MB | 120ms
+```
+
+格式：`[群名或聊天类型(chatId)][昵称(@username, userId)]` + 事件（进池/解析/下载/发送/原文件按钮/拒绝/失败，均含耗时）。
+
 ## 配置（bot.config.json）
 
 所有配置集中在 `bot.config.json`（含 token，已加入 .gitignore 不入库）：
