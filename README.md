@@ -40,7 +40,10 @@ wx-video/
    ./bot.sh log        # 实时日志（Ctrl+C 退出）
    ./bot.sh restart    # 重启
    ./bot.sh stop       # 停止
+   ./bot.sh autostart on   # 开机自启（登录后自动启动）
    ```
+
+> **开机自启说明**：`./bot.sh autostart on` 通过 crontab `@reboot` 实现。本机 home 位于外置卷 `外置卷`，launchd 只从启动卷加载 LaunchAgent（已验证 `launchctl` 报 I/O error），crontab 方式无需 sudo、登录即启动。
 
 > 网络要求：Telegram API 走代理（配置文件 `proxy` 字段优先，缺省读 `http_proxy`/`https_proxy` 环境变量），视频下载走直连。
 
