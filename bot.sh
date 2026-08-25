@@ -127,29 +127,24 @@ autostart_on() {
 </dict>
 </plist>
 EOF
-  # 需要 sudo（会提示输入密码）
+  # 需要 sudo（会提示输入密码）：只写入 plist 完成"开机自启注册"，
+  # 不 bootstrap/load——启动服务是 ./bot.sh start 的事（两件事分开）
   sudo cp /tmp/com.wxvideo.bot.plist "$PLIST" || { echo "❌ 写入 $PLIST 失败（sudo 取消？）"; exit 1; }
-  local uid; uid="$(id -u)"
-  launchctl bootout "gui/${uid}/com.wxvideo.bot" 2>/dev/null || true
-  if launchctl bootstrap "gui/${uid}" "$PLIST" 2>/dev/null; then
-    echo "✅ 开机自启已启用（系统 LaunchAgent：登录启动 + 崩溃自动重启）"
-  else
-    launchctl load "$PLIST" 2>/dev/null && echo "✅ 开机自启已启用（兼容 load 方式）" || echo "❌ 加载失败，请手动执行: launchctl load $PLIST"
-  fi
   rm -f /tmp/com.wxvideo.bot.plist
+  echo "✅ 开机自启已配置（下次登录时 launchd 自动启动机器人）"
+  echo "   现在启动请执行: ./bot.sh start"
 }
 
 autostart_off() {
-  local uid; uid="$(id -u)"
-  launchctl bootout "gui/${uid}/com.wxvideo.bot" 2>/dev/null || true
-  launchctl unload "$PLIST" 2>/dev/null || true
+  # 只移除开机自启注册，不停止正在运行的服务（停止用 ./bot.sh stop）
+  launchctl bootout "gui/$(id -u)/com.wxvideo.bot" 2>/dev/null || true
   sudo rm -f "$PLIST" 2>/dev/null || true
-  echo "✅ 开机自启已关闭"
+  echo "✅ 开机自启已关闭（运行中的服务不受影响，如需停止: ./bot.sh stop）"
 }
 
 autostart_status() {
   if [ ! -f "$PLIST" ]; then
-    echo "未启用（无 $PLIST）"
+    echo "未启用（无 ${PLIST}）"
     return 0
   fi
   if launchctl list | grep -q "$LABEL"; then

@@ -481,7 +481,7 @@ async function handleMessage(msg) {
   const uniqueIds = [...new Set(ids)];
 
   // 停机期间发的消息（消息时间早于当前 10 分钟以上）标记为补发
-  const backlog = Date.now() / 1000 - (msg.date || 0) > 600;
+  const backlog = !!msg.date && Date.now() / 1000 - msg.date > 600;
   log(`${who} ${backlog ? '[补发] ' : ''}收到${isPrivate ? '私聊' : '群聊'}链接 ${uniqueIds.length} 条: ${uniqueIds.map((i) => i.split('##')[0]).join(', ')} | 原文: ${rawText.slice(0, 80)}`);
   for (const id of uniqueIds) {
     await processLink(chatId, userId, id, msg.message_id, msg.chat.type, msg.from, who, backlog);
