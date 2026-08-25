@@ -160,7 +160,7 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention, title) {
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention, title, backlog) {
   const data = fs.readFileSync(filePath);
   const fields = {
     chat_id: String(chatId),
@@ -169,8 +169,9 @@ async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToM
     supports_streaming: 'true',
     reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
   };
-  // 视频标题（单行化）+ 群聊时 @ 原消息发送人
-  const cap = title ? String(title).replace(/\s*\n+\s*/g, ' ').trim().slice(0, 1024) : '';
+  // 视频标题（单行化）+ 补发标注 + 群聊时 @ 原消息发送人
+  let cap = title ? String(title).replace(/\s*\n+\s*/g, ' ').trim().slice(0, 1024) : '';
+  if (backlog && cap) cap = `${cap}（补发）`;
   if (cap) {
     if (mention && mention.type === 'username') {
       fields.caption = `${cap}\n${mention.value}`;
@@ -287,7 +288,7 @@ function buildMention(chatType, from) {
   return { type: 'text_mention', value: name, userId: from.id };
 }
 
-async function processLink(chatId, userId, link, replyToMsgId, chatType, from, who) {
+async function processLink(chatId, userId, link, replyToMsgId, chatType, from, who, backlog) {
   // 进度消息：reply 到用户消息，首条 sendMessage 创建，后续 editMessageText 原地更新，结束 deleteMessage 清理
   let statusMsgId = null;
   const status = async (text) => {
@@ -319,7 +320,7 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from, w
     let info, id, shortCode;
     try {
       await status('🔄 正在解析...');
-      id = parseId(link);
+      id = link;   // 调用方已通过 parseId 校验并归一化为 <短码>##N
       shortCode = id.split('##')[0];
       const t0 = Date.now();
       info = await resolveOrFake(id);
@@ -402,7 +403,7 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from, w
     await sendChatAction(chatId, 'upload_video');
     const upT0 = Date.now();
     try {
-      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from), info.title));
+      await tgWithRetry(() => sendVideoWithButton(chatId, filePath, shortId, info.fileSize, replyToMsgId, buildMention(chatType, from), info.title, backlog));
       await statusDone();
       log(`${who} 发送成功: ${path.basename(filePath)} | ${(info.fileSize / 1048576).toFixed(1)} MB | 上传 ${Date.now() - upT0}ms`);
     } catch (e) {
@@ -466,15 +467,25 @@ async function handleMessage(msg) {
     return;
   }
 
-  // 私聊: 支持链接与直接短码; 群聊: 只识别含微信视频号链接的消息（不要求 @）
+  // 提取本条消息里的所有微信视频号链接（私聊额外支持整条纯短码）
   const isPrivate = msg.chat.type === 'private';
   if (!isPrivate && !/(weixin\.qq\.com\/sph\/|channels\.weixin\.qq\.com\/finder-preview\/pages\/sph)/.test(rawText)) return;
-  const link = rawText.trim();
-  if (!link) return;
+  const ids = [];
+  for (const m of rawText.matchAll(/https?:\/\/\S+/g)) {
+    try { ids.push(parseId(m[0])); } catch {}
+  }
+  if (ids.length === 0 && isPrivate && /^[A-Za-z0-9_-]+$/.test(rawText.trim())) {
+    try { ids.push(parseId(rawText.trim())); } catch {}
+  }
+  if (ids.length === 0) return;   // 不是视频号链接，静默忽略
+  const uniqueIds = [...new Set(ids)];
 
-  try { parseId(link); } catch { return; }   // 不是视频号链接，静默忽略
-  log(`${who} 收到${isPrivate ? '私聊' : '群聊'}链接: ${parseId(link).split('##')[0]} | 原文: ${rawText.slice(0, 80)}`);
-  await processLink(chatId, userId, link, msg.message_id, msg.chat.type, msg.from, who);
+  // 停机期间发的消息（消息时间早于当前 10 分钟以上）标记为补发
+  const backlog = Date.now() / 1000 - (msg.date || 0) > 600;
+  log(`${who} ${backlog ? '[补发] ' : ''}收到${isPrivate ? '私聊' : '群聊'}链接 ${uniqueIds.length} 条: ${uniqueIds.map((i) => i.split('##')[0]).join(', ')} | 原文: ${rawText.slice(0, 80)}`);
+  for (const id of uniqueIds) {
+    await processLink(chatId, userId, id, msg.message_id, msg.chat.type, msg.from, who, backlog);
+  }
 }
 
 // ---------- 长轮询主循环 ----------

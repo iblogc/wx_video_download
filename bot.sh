@@ -10,11 +10,9 @@ LOG_FILE="$LOG_DIR/bot-$(TZ=Asia/Shanghai date +%F).log"
 PID_FILE="$DIR/bot.pid"
 CONFIG="$DIR/bot.config.json"
 
+agent_installed() { [ -f "$PLIST" ]; }
+
 start() {
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "已在运行 (PID $(cat "$PID_FILE"))"
-    return 0
-  fi
   if [ ! -f "$CONFIG" ] || ! grep -q '"token"' "$CONFIG" 2>/dev/null; then
     echo "错误: $CONFIG 里未配置 token"
     echo "  参考: cp bot.config.example.json bot.config.json 并填入你的 token"
@@ -22,6 +20,14 @@ start() {
   fi
   mkdir -p "$LOG_DIR"
   # bot 内部按天写日志文件（logs/bot-YYYY-MM-DD.log），stdout 仅保留启动错误
+  if agent_installed; then
+    # LaunchAgent 模式：交给 launchd 管理（登录自启 + 崩溃自愈）
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    sleep 1
+    echo "已通过 launchd 启动 (label: $LABEL)"
+    return 0
+  fi
   nohup "$NODE_BIN" "$BOT" > "$LOG_DIR/bot.out" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
@@ -29,6 +35,12 @@ start() {
 }
 
 stop() {
+  if agent_installed && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$LABEL"
+    rm -f "$PID_FILE"
+    echo "已停止（launchd 卸载）"
+    return 0
+  fi
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     kill "$(cat "$PID_FILE")" && rm -f "$PID_FILE" && echo "已停止"
   else
@@ -40,7 +52,10 @@ stop() {
 restart() { stop; sleep 1; start; }
 
 status() {
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  if agent_installed && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "运行中 (launchd 管理)"
+    [ -f "$LOG_FILE" ] && tail -3 "$LOG_FILE"
+  elif [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "运行中 (PID $(cat "$PID_FILE"))"
     [ -f "$LOG_FILE" ] && tail -3 "$LOG_FILE"
   else
@@ -58,47 +73,89 @@ log() {
 }
 
 # ---------- 开机自启 ----------
-# 说明: 用户 home 位于外置卷（外置卷），launchd 只从启动卷加载 LaunchAgent，
-#       因此用 crontab @reboot 实现（登录后自动启动，无需 sudo）。
+# 环境结论（实测）:
+#   - macOS 用户级 crontab @reboot 不可靠（cron 登录时才启动，开机无会话时跳过）
+#   - home 位于外置卷 外置卷，用户级 LaunchAgent 无法加载（launchctl I/O error）
+#   - macOS 新版 AppleScript 登录项对脚本/.app 静默失败或卡授权
+# 因此采用系统级 LaunchAgent（/Library/LaunchAgents，启动卷 ✓，需要一次 sudo 密码）：
+#   登录即启动 + KeepAlive 崩溃自动重启，最可靠。
 NODE_BIN="$(command -v node 2>/dev/null)"
-if [ -z "$NODE_BIN" ]; then   # cron 环境 PATH 精简，探测常见安装位置
+if [ -z "$NODE_BIN" ]; then
   for p in "$HOME/.local/share/fnm/node-versions"/*/installation/bin/node /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
     [ -x "$p" ] && { NODE_BIN="$p"; break; }
   done
 fi
 CRON_LINE="@reboot ${DIR}/bot.sh start"
+PLIST="/Library/LaunchAgents/com.wxvideo.bot.plist"
+LABEL="com.wxvideo.bot"
 
 autostart_on() {
   if [ -z "$NODE_BIN" ]; then
     echo "错误: 找不到 node"
     exit 1
   fi
+  # 清理旧的 crontab 方式
   local tmp; tmp="$(mktemp)"
-  crontab -l 2>/dev/null > "$tmp" || true
-  if grep -qF "$CRON_LINE" "$tmp"; then
-    echo "开机自启已存在，无需重复添加"
-  else
-    echo "$CRON_LINE" >> "$tmp"
-    crontab "$tmp"
-    echo "✅ 开机自启已启用（登录后自动启动机器人）"
-  fi
+  crontab -l 2>/dev/null | grep -vF "$CRON_LINE" > "$tmp" || true
+  crontab "$tmp" 2>/dev/null || true
   rm -f "$tmp"
+  # 生成 plist
+  cat > /tmp/com.wxvideo.bot.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${NODE_BIN}</string>
+        <string>${BOT}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/bot.out</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/bot.out</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+EOF
+  # 需要 sudo（会提示输入密码）
+  sudo cp /tmp/com.wxvideo.bot.plist "$PLIST" || { echo "❌ 写入 $PLIST 失败（sudo 取消？）"; exit 1; }
+  local uid; uid="$(id -u)"
+  launchctl bootout "gui/${uid}/com.wxvideo.bot" 2>/dev/null || true
+  if launchctl bootstrap "gui/${uid}" "$PLIST" 2>/dev/null; then
+    echo "✅ 开机自启已启用（系统 LaunchAgent：登录启动 + 崩溃自动重启）"
+  else
+    launchctl load "$PLIST" 2>/dev/null && echo "✅ 开机自启已启用（兼容 load 方式）" || echo "❌ 加载失败，请手动执行: launchctl load $PLIST"
+  fi
+  rm -f /tmp/com.wxvideo.bot.plist
 }
 
 autostart_off() {
-  local tmp; tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$CRON_LINE" > "$tmp" || true
-  crontab "$tmp"
-  rm -f "$tmp"
+  local uid; uid="$(id -u)"
+  launchctl bootout "gui/${uid}/com.wxvideo.bot" 2>/dev/null || true
+  launchctl unload "$PLIST" 2>/dev/null || true
+  sudo rm -f "$PLIST" 2>/dev/null || true
   echo "✅ 开机自启已关闭"
 }
 
 autostart_status() {
-  if crontab -l 2>/dev/null | grep -qF "$CRON_LINE"; then
-    echo "已启用（crontab @reboot → ./bot.sh start）"
-    crontab -l | grep -F "$CRON_LINE"
+  if [ ! -f "$PLIST" ]; then
+    echo "未启用（无 $PLIST）"
+    return 0
+  fi
+  if launchctl list | grep -q "$LABEL"; then
+    echo "已启用，launchd 管理运行中"
   else
-    echo "未启用"
+    echo "已配置但未加载（可能需重新登录或 launchctl load）"
   fi
 }
 
