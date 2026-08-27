@@ -136,6 +136,10 @@ EOF
 }
 
 autostart_off() {
+  # 清理历史登录项残留（早期"登录项自启"方案把 bot.mjs/bot.sh 加进了登录项，
+  # 导致每次登录被默认应用（编辑器）打开）
+  osascript -e 'tell application "System Events" to delete login item "bot.sh"' 2>/dev/null || true
+  osascript -e 'tell application "System Events" to delete login item "bot.mjs"' 2>/dev/null || true
   # 只移除开机自启注册，不停止正在运行的服务（停止用 ./bot.sh stop）
   launchctl bootout "gui/$(id -u)/com.wxvideo.bot" 2>/dev/null || true
   sudo rm -f "$PLIST" 2>/dev/null || true
