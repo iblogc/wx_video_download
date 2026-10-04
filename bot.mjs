@@ -58,7 +58,7 @@ if (!TOKEN) {
 // ---------- 工具 ----------
 const tzFmt = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const dayFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });  // en-CA → YYYY-MM-DD
-const LOG_DIR = path.join(DIR, 'logs');
+const LOG_DIR = process.env.BOT_LOG_DIR || path.join(DIR, 'logs');
 function dayKey() { return dayFmt.format(new Date()); }
 function writeLog(line) {
   try {

@@ -112,6 +112,7 @@ export function spawnBot(port, { extraEnv = {}, config = {}, args = [], dir, set
     ...process.env,
     TEST_TG_BASE: 'http://127.0.0.1:' + port,
     BOT_CONFIG: cfg,
+    BOT_LOG_DIR: path.join(tmp, 'logs'),   // 测试日志写临时目录，不污染仓库 logs/
     FAKE_NETWORK: '1',
     http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '',
     ...extraEnv,
