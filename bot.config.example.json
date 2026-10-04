@@ -3,5 +3,8 @@
   "downloadDir": "~/Downloads/wx-videos",
   "maxTasks": 5,
   "allowedUsers": [],
+  "channelId": "",
+  "channelCaption": true,
+  "channelButton": true,
   "proxy": { "host": "127.0.0.1", "port": 1080 }
 }

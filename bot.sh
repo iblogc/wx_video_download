@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 微信视频下载机器人管理脚本
-# 用法: ./bot.sh {start|stop|restart|status|log}
+# 用法: ./bot.sh {start|stop|restart|status|log|backfill}
 # 配置统一在 bot.config.json（token/downloadDir/maxTasks/allowedUsers/proxy，见 bot.config.example.json）
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,6 +164,13 @@ case "$1" in
   restart) restart ;;
   status)  status ;;
   log|logs) log ;;
+  backfill)
+    # 补发历史视频到频道（可与运行中的机器人同时进行）：
+    #   ./bot.sh backfill --dry-run          只列清单，不发送
+    #   ./bot.sh backfill --limit 30         本批发 30 条（从最早的开始）
+    shift
+    exec "$NODE_BIN" "$BOT" --backfill "$@"
+    ;;
   autostart)
     case "$2" in
       on) autostart_on ;;
@@ -172,5 +179,5 @@ case "$1" in
       *) echo "用法: ./bot.sh autostart {on|off|status}" ; exit 1 ;;
     esac
     ;;
-  *) echo "用法: ./bot.sh {start|stop|restart|status|log|autostart}" ; exit 1 ;;
+  *) echo "用法: ./bot.sh {start|stop|restart|status|log|backfill|autostart}" ; exit 1 ;;
 esac

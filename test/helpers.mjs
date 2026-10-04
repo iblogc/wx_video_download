@@ -15,12 +15,15 @@ import { fileURLToPath } from 'node:url';
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-export function startMockTelegram(port) {
+export function startMockTelegram(port, { failChats = [] } = {}) {
+  const fail = new Set(failChats.map(String));
   const stats = {
     texts: [],          // { chat, text, msgId }
     videos: 0, documents: 0, edits: 0, deletes: 0, actions: [], answers: [],
     button: null,       // 最近一次 sendVideo 的按钮
     callbackData: null,
+    videoSends: [],     // 每次 sendVideo: { chat, replyTo, caption, entities, callback }
+    documentChats: [],  // 每次 sendDocument 的 chat_id
   };
   let msgSeq = 100;
   const queue = [];
@@ -57,6 +60,10 @@ export function startMockTelegram(port) {
         req.on('data', (c) => chunks.push(c));
         req.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8');
+          const chatId = (text.match(/name="chat_id"\r\n\r\n([^\r]+)/) || [])[1];
+          if (fail.has(String(chatId))) {
+            return res.end(JSON.stringify({ ok: false, description: 'Forbidden: bot is not a member of the channel chat', parameters: { retry_after: 0.05 } }));
+          }
           if (method === 'sendVideo') {
             stats.videos++;
             const m = text.match(/name="reply_markup"\r\n\r\n([^\r]+)/);
@@ -72,8 +79,10 @@ export function startMockTelegram(port) {
             stats.videoCaption = cap ? cap[1] : null;
             const ents = text.match(/name="caption_entities"\r\n\r\n([^\r]+)/);
             stats.videoCaptionEntities = ents ? ents[1] : null;
+            stats.videoSends.push({ chat: chatId, replyTo: rm ? rm[1] : null, hasReplyField: /name="reply_to_message_id"/.test(text), hasButton: /name="reply_markup"/.test(text), hasCaption: /name="caption"/.test(text), width: (text.match(/name="width"\r\n\r\n([^\r]+)/) || [])[1] || null, height: (text.match(/name="height"\r\n\r\n([^\r]+)/) || [])[1] || null, duration: (text.match(/name="duration"\r\n\r\n([^\r]+)/) || [])[1] || null, caption: stats.videoCaption, entities: stats.videoCaptionEntities, callback: stats.callbackData });
           } else {
             stats.documents++;
+            stats.documentChats.push(chatId);
             const fm = text.match(/name="document"[\s\S]*?filename="([^"]+)"/);
             stats.documentFilename = fm ? fm[1] : null;
           }
@@ -86,18 +95,19 @@ export function startMockTelegram(port) {
     }
   });
   return {
-    server, stats, queue,
+    server, stats, queue, fail,
     push: (u) => queue.push(u),
     listen: () => new Promise((r) => server.listen(port, r)),
     close: () => new Promise((r) => server.close(r)),
   };
 }
 
-export function spawnBot(port, { extraEnv = {}, config = {} } = {}) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wxbot-test-'));
+export function spawnBot(port, { extraEnv = {}, config = {}, args = [], dir, setup } = {}) {
+  const tmp = dir || fs.mkdtempSync(path.join(os.tmpdir(), 'wxbot-test-'));
   const dl = path.join(tmp, 'dl');
   const cfg = path.join(tmp, 'config.json');
   fs.writeFileSync(cfg, JSON.stringify({ token: 'mocktoken', downloadDir: dl, maxTasks: 5, ...config }));
+  if (setup) setup(dl, cfg);   // 预置数据（如 cache.json + 视频文件），在启动前执行
   const env = {
     ...process.env,
     TEST_TG_BASE: 'http://127.0.0.1:' + port,
@@ -106,11 +116,13 @@ export function spawnBot(port, { extraEnv = {}, config = {} } = {}) {
     http_proxy: '', https_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: '',
     ...extraEnv,
   };
-  const child = spawn('node', ['bot.mjs'], { env, cwd: ROOT });
-  child.stdout.on('data', (d) => process.stdout.write('[bot] ' + d));
-  child.stderr.on('data', (d) => process.stdout.write('[bot-err] ' + d));
+  const child = spawn('node', ['bot.mjs', ...args], { env, cwd: ROOT });
+  const out = [];
+  child.stdout.on('data', (d) => { out.push(d.toString()); process.stdout.write('[bot] ' + d); });
+  child.stderr.on('data', (d) => { out.push(d.toString()); process.stdout.write('[bot-err] ' + d); });
   return {
     child, dl, cfg, tmp,
+    output: () => out.join(''),
     kill: () => { try { child.kill(); } catch {} },
     cleanup: () => { try { child.kill(); } catch {} fs.rmSync(tmp, { recursive: true, force: true }); },
   };

@@ -5,6 +5,7 @@
  * 用法:
  *   TG_BOT_TOKEN=<token> node bot.mjs            # 前台运行
  *   TG_BOT_TOKEN=<token> nohup node bot.mjs > bot.log 2>&1 &   # 后台运行
+ *   node bot.mjs --backfill [--limit N] [--interval S] [--no-caption] [--no-button] [--dry-run]   # 把历史下载的视频补发到频道
  *
  * 功能:
  *   - 私聊直接发链接；群聊需 @机器人 才响应
@@ -18,6 +19,8 @@
  *   - Telegram API 走本机代理（自动读 http_proxy/https_proxy 环境变量）
  *   - 媒体下载直连（腾讯 CDN 国内可达）
  */
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -160,17 +163,61 @@ const sendMessage = (chatId, text) => tgRequest('sendMessage', { query: { chat_i
 const sendChatAction = (chatId, action) => tgRequest('sendChatAction', { query: { chat_id: chatId, action } });
 const answerCallback = (id, text) => tgRequest('answerCallbackQuery', { query: { callback_query_id: id, text } });
 
-async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention, title, backlog) {
+// ---------- 视频尺寸探测 ----------
+// Telegram 服务端解析不了这些 mp4（tkhd 的 width/height 为 0），抓不到真实尺寸时会退回方图缩略图
+// 当视频尺寸 —— 客户端按 1:1 布局，竖屏视频就被拉伸。官方客户端上传时会附带 width/height/duration，
+// 所以这里同样用 ffprobe 取真实尺寸一并上传；取不到则退回旧行为（仅缺尺寸，不影响发送成功与否）。
+const FFPROBE = process.env.FFPROBE || 'ffprobe';
+let probeWarned = false;
+const probeCache = new Map();
+function probeVideoMeta(file) {
+  let key;
+  try { const st = fs.statSync(file); key = `${file}:${st.size}:${st.mtimeMs}`; } catch { return null; }
+  if (probeCache.has(key)) return probeCache.get(key);
+  let meta = null;
+  try {
+    const out = execFileSync(FFPROBE, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:stream_side_data=rotation:format=duration', '-of', 'json', file], { timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const j = JSON.parse(out.toString());
+    const s = j.streams && j.streams[0];
+    if (s && s.width && s.height) {
+      let w = +s.width, h = +s.height;
+      const rot = Math.abs((((s.side_data_list || [])[0] || {}).rotation || 0) % 180);
+      if (rot === 90) [w, h] = [h, w];   // 带旋转的视频：显示尺寸与编码尺寸互换
+      const dur = j.format && parseFloat(j.format.duration);
+      meta = { width: w, height: h, duration: dur > 0 ? Math.round(dur) : null };
+    }
+  } catch (e) {
+    if (!probeWarned) {
+      probeWarned = true;
+      log('⚠️ ffprobe 不可用，视频尺寸交由 Telegram 推断（部分竖屏视频比例可能显示不对）:', String(e.message).slice(0, 80));
+    }
+  }
+  probeCache.set(key, meta);
+  return meta;
+}
+
+async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToMsgId, mention, title, backlog, opts = {}) {
+  const { caption = true, button = true } = opts;
   const data = fs.readFileSync(filePath);
   const fields = {
     chat_id: String(chatId),
-    reply_to_message_id: String(replyToMsgId || ''),
     video: { data, filename: path.basename(filePath), contentType: 'video/mp4' },
     supports_streaming: 'true',
-    reply_markup: JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] }),
   };
-  // 视频标题（单行化）+ 补发标注 + 群聊时 @ 原消息发送人
-  let cap = title ? String(title).replace(/\s*\n+\s*/g, ' ').trim().slice(0, 1024) : '';
+  if (button) {
+    fields.reply_markup = JSON.stringify({ inline_keyboard: [[{ text: `📥 获取原文件 ${(fileSize / 1048576).toFixed(1)} MB`, callback_data: 'orig_' + shortId }]] });
+  }
+  // 频道同步等无「被回复消息」的场景不传该字段（空串会被 Telegram 判为非法）
+  if (replyToMsgId) fields.reply_to_message_id = String(replyToMsgId);
+  // 附带真实尺寸（缺了会被 Telegram 用方图缩略图当尺寸，导致比例失真）
+  const vmeta = probeVideoMeta(filePath);
+  if (vmeta) {
+    fields.width = String(vmeta.width);
+    fields.height = String(vmeta.height);
+    if (vmeta.duration) fields.duration = String(vmeta.duration);
+  }
+  // 视频标题（单行化）+ 补发标注 + 群聊时 @ 原消息发送人（caption=false 时整段不发）
+  let cap = caption && title ? String(title).replace(/\s*\n+\s*/g, ' ').trim().slice(0, 1024) : '';
   if (backlog && cap) cap = `${cap}（补发）`;
   if (cap) {
     if (mention && mention.type === 'username') {
@@ -181,7 +228,7 @@ async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToM
     } else {
       fields.caption = cap;
     }
-  } else if (mention) {   // 无标题时的兜底（保留纯 @）
+  } else if (caption && mention) {   // 无标题时的兜底（保留纯 @）
     if (mention.type === 'username') {
       fields.caption = mention.value;
     } else {
@@ -190,7 +237,16 @@ async function sendVideoWithButton(chatId, filePath, shortId, fileSize, replyToM
     }
   }
   const { body, contentType } = buildMultipart(fields);
-  return tgRequest('sendVideo', { body, headers: { 'content-type': contentType } });
+  const r = await tgRequest('sendVideo', { body, headers: { 'content-type': contentType } });
+  // 自检：Telegram 回报的尺寸若与真实尺寸长宽比不符，说明它仍按缩略图猜尺寸（比例会失真）
+  if (vmeta && r.ok && r.result && r.result.video && r.result.video.width && r.result.video.height) {
+    const local = vmeta.width / vmeta.height;
+    const got = r.result.video.width / r.result.video.height;
+    if (Math.abs(local - got) / local > 0.01) {
+      log(`⚠️ 尺寸被 Telegram 误判（比例会失真）: 本地 ${vmeta.width}x${vmeta.height} → Telegram ${r.result.video.width}x${r.result.video.height} | ${path.basename(filePath)}`);
+    }
+  }
+  return r;
 }
 
 async function sendDocumentFile(chatId, filePath) {
@@ -247,12 +303,58 @@ function cacheFileExists(entry) {
   return !!(p && fs.existsSync(p) && fs.statSync(p).size > 0);
 }
 
+// 频道同步去重：同一视频每个频道只同步一次（标记存在 cache.json 的条目里：mirroredChannel 记录已同步到的频道）
+// 先占位后发送：并发请求同时到达时只有一个能占到；发送失败回滚，便于下次重试
+function claimMirror(shortCode, target) {
+  return withIoLock(() => {
+    const c = loadCache();
+    const e = c[shortCode];
+    if (!e) return true;                     // 条目缺失（缓存被清）时放行，不做去重
+    if (e.mirroredChannel === target) return false;
+    e.mirroredChannel = target;
+    saveCache(c);
+    return true;
+  });
+}
+function unclaimMirror(shortCode, target) {
+  return withIoLock(() => {
+    const c = loadCache();
+    const e = c[shortCode];
+    if (e && e.mirroredChannel === target) { delete e.mirroredChannel; saveCache(c); }
+  });
+}
+
 // 索引文件（cache.json / meta.json）读改写串行化，避免并发丢失条目
+// 进程内：ioChain 串行；跨进程（补发模式与常驻机器人同时改索引）：索引锁文件互斥
 let ioChain = Promise.resolve();
 function withIoLock(fn) {
-  const run = ioChain.then(fn, fn);
+  const run = ioChain.then(() => withFileLock(fn), () => withFileLock(fn));
   ioChain = run.catch(() => {});
   return run;
+}
+
+const LOCK_FILE = path.join(DOWNLOADS_DIR, '.io.lock');
+const LOCK_STALE_MS = 30000;      // 单次临界区仅做本地 JSON 读写（毫秒级），超时视为残留锁
+async function withFileLock(fn) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const fd = fs.openSync(LOCK_FILE, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try { if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK_FILE); continue; } } catch {}
+      if (Date.now() - t0 > LOCK_STALE_MS) {   // 持有者异常：抢锁继续，避免机器人卡死
+        try { fs.unlinkSync(LOCK_FILE); } catch {}
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+  try { return fn(); } finally { try { fs.unlinkSync(LOCK_FILE); } catch {} }
 }
 
 // 同一短码的在途下载去重：并发请求共享同一次下载
@@ -286,6 +388,17 @@ function buildMention(chatType, from) {
   if (from.username) return { type: 'username', value: '@' + from.username };
   const name = String(from.first_name || '用户').slice(0, 64);
   return { type: 'text_mention', value: name, userId: from.id };
+}
+
+// 同步频道（每个视频回复成功后额外发一份到该频道）：动态读配置，改完即时生效；空=关闭
+function mirrorChannelId() {
+  const v = loadConfig().channelId;
+  return v == null || v === '' ? null : String(v);
+}
+// 频道那份是否带标题文本 / 「获取原文件」按钮（bot.config.json: channelCaption / channelButton，默认都开）
+function mirrorOpts() {
+  const c = loadConfig();
+  return { caption: c.channelCaption !== false, button: c.channelButton !== false };
 }
 
 async function processLink(chatId, userId, link, replyToMsgId, chatType, from, who, backlog) {
@@ -410,6 +523,21 @@ async function processLink(chatId, userId, link, replyToMsgId, chatType, from, w
       await status('❌ 上传失败: ' + e.message.slice(0, 200));
       log(`${who} ❌ 上传失败: ${e.message}`);
     }
+
+    // 同步一份到指定频道（bot.config.json 的 channelId；同一视频每个频道只同步一次，失败只记日志）
+    const mirror = mirrorChannelId();
+    if (mirror && mirror !== String(chatId) && await claimMirror(shortCode, mirror)) {
+      const mOpts = mirrorOpts();
+      const mT0 = Date.now();
+      try {
+        await sendChatAction(mirror, 'upload_video');
+        await tgWithRetry(() => sendVideoWithButton(mirror, filePath, shortId, info.fileSize, null, null, info.title, false, mOpts));
+        log(`${who} 已同步频道 ${mirror}: ${path.basename(filePath)} | 上传 ${Date.now() - mT0}ms`);
+      } catch (e) {
+        await unclaimMirror(shortCode, mirror);
+        log(`${who} ⚠️ 同步频道失败 ${mirror}: ${e.message}`);
+      }
+    }
   } finally {
     release();
   }
@@ -486,6 +614,109 @@ async function handleMessage(msg) {
   for (const id of uniqueIds) {
     await processLink(chatId, userId, id, msg.message_id, msg.chat.type, msg.from, who, backlog);
   }
+}
+
+// ---------- 补发模式（--backfill）：把历史下载的视频陆续同步到频道 ----------
+// node bot.mjs --backfill [--limit N] [--interval S] [--dry-run]
+// 可与常驻机器人同时运行（索引读写走跨进程锁）；按下载时间先后发，成功后记 mirroredChannel，可中断续跑
+function argValue(name, def) {
+  const i = process.argv.indexOf(name);
+  const v = i >= 0 ? process.argv[i + 1] : null;
+  return v != null && !v.startsWith('--') ? v : def;
+}
+const sha1File = (p) => crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+// 文件名 → 标题：去掉扩展名与同名去重后缀「 (2)」
+const captionOf = (file) => file.replace(/\.mp4$/i, '').replace(/ \(\d+\)$/, '');
+
+async function backfill() {
+  const dryRun = process.argv.includes('--dry-run');
+  const limit = Math.max(0, parseInt(argValue('--limit', '0'), 10) || 0);
+  const intervalMs = Math.max(0, parseFloat(argValue('--interval', '3')) || 0) * 1000;
+  const channel = mirrorChannelId();
+  if (!channel) { log('[补发] ❌ bot.config.json 未配置 channelId'); return 1; }
+  // 频道那份是否带标题文本 / 「获取原文件」按钮：跟随配置，命令行可强制关掉
+  const cfgOpts = mirrorOpts();
+  const sendOpts = { caption: cfgOpts.caption && !process.argv.includes('--no-caption'), button: cfgOpts.button && !process.argv.includes('--no-button') };
+
+  // 1) 收集：同一文件只算一次，按下载时间升序
+  const cache = loadCache();
+  const seenFile = new Set();
+  const all = [], missing = [];
+  for (const [shortCode, e] of Object.entries(cache)) {
+    if (!e || !e.file || seenFile.has(e.file)) continue;
+    seenFile.add(e.file);
+    const p = cachePathOf(e);
+    let st;
+    try { st = fs.statSync(p); } catch { missing.push(e.file); continue; }
+    all.push({ shortCode, file: e.file, path: p, size: st.size, mtime: st.mtimeMs });
+  }
+  all.sort((a, b) => a.mtime - b.mtime);
+
+  // 2) 内容去重：同字节数才比对 sha1（同内容只发一次，其余记为同内容条目）
+  const sizeCount = new Map();
+  for (const it of all) sizeCount.set(it.size, (sizeCount.get(it.size) || 0) + 1);
+  const seenKey = new Map();
+  const items = [], dupes = [], tooBig = [];
+  for (const it of all) {
+    if (it.size > MAX_UPLOAD) { tooBig.push(it); continue; }
+    const key = sizeCount.get(it.size) > 1 ? 'sha1:' + sha1File(it.path) : 'size:' + it.size;
+    const first = seenKey.get(key);
+    if (first) { dupes.push({ it, first }); continue; }
+    seenKey.set(key, it);
+    items.push(it);
+  }
+
+  const mirrored = (shortCode) => (loadCache()[shortCode] || {}).mirroredChannel === channel;
+  const pending = items.filter((it) => !mirrored(it.shortCode));
+  const batch = limit > 0 ? pending.slice(0, limit) : pending;
+  const bytes = batch.reduce((a, it) => a + it.size, 0);
+
+  log(`[补发] 频道 ${channel} | 唯一内容 ${items.length} | 已同步 ${items.length - pending.length} | 待补发 ${pending.length} | 同内容 ${dupes.length} | 超限 ${tooBig.length} | 缺失 ${missing.length}`);
+  if (tooBig.length) log(`[补发] 超 50MB 无法发送: ${tooBig.map((x) => x.file).join(', ')}`);
+  if (missing.length) log(`[补发] 文件不存在: ${missing.join(', ')}`);
+  log(`[补发] 本次 ${batch.length} 条，合计 ${(bytes / 1048576).toFixed(1)} MB，间隔 ${intervalMs / 1000}s，标题${sendOpts.caption ? '开' : '关'}，按钮${sendOpts.button ? '开' : '关'}${dryRun ? '（--dry-run，不发送）' : ''}`);
+
+  if (dryRun) {
+    for (const [i, it] of batch.entries()) {
+      log(`[补发] #${i + 1} ${it.file} | ${(it.size / 1048576).toFixed(1)} MB | ${new Date(it.mtime).toISOString().slice(0, 16).replace('T', ' ')}`);
+    }
+    log(`[补发] 预计 ≥ ${Math.ceil(batch.length * intervalMs / 1000)}s（上传时间另计）`);
+    return 0;
+  }
+
+  // 3) 逐条补发：先占位（跨进程去重）→ 发视频（带「获取原文件」按钮）→ 失败回滚标记，下次重跑自动重试
+  let sent = 0, failed = 0;
+  for (const [i, it] of batch.entries()) {
+    if (i > 0) await new Promise((r) => setTimeout(r, intervalMs));
+    if (!(await claimMirror(it.shortCode, channel))) { log(`[补发] 跳过（已被其他进程同步）: ${it.file}`); continue; }
+    const shortId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const t0 = Date.now();
+    try {
+      await withIoLock(() => {
+        const meta = loadGlobalMeta();
+        meta[shortId] = { file: it.file, size: it.size };
+        saveGlobalMeta(meta);
+      });
+      await sendChatAction(channel, 'upload_video');
+      await tgWithRetry(() => sendVideoWithButton(channel, it.path, shortId, it.size, null, null, captionOf(it.file), false, sendOpts));
+      sent++;
+      log(`[补发] ${i + 1}/${batch.length} 已发送: ${it.file} | ${(it.size / 1048576).toFixed(1)} MB | ${Date.now() - t0}ms | 剩余 ${batch.length - i - 1}`);
+    } catch (e) {
+      failed++;
+      await unclaimMirror(it.shortCode, channel);
+      log(`[补发] ${i + 1}/${batch.length} ❌ 失败: ${it.file} | ${e.message}`);
+    }
+  }
+
+  // 4) 同内容条目：内容已在频道里，标记为已同步，避免以后被请求时重复发
+  let dupMarked = 0;
+  for (const { it, first } of dupes) {
+    if (mirrored(first.shortCode) && await claimMirror(it.shortCode, channel)) dupMarked++;
+  }
+
+  const left = items.filter((it) => !mirrored(it.shortCode)).length;
+  log(`[补发] 完成：成功 ${sent}，失败 ${failed}，同内容标记 ${dupMarked}；剩余待补发 ${left} 条（再跑一次继续）`);
+  return failed ? 1 : 0;
 }
 
 // ---------- 长轮询主循环 ----------
@@ -572,6 +803,11 @@ if (!me.username) {
   process.exit(1);
 }
 botUsername = me.username;
+
+// 补发模式：把历史下载的视频陆续同步到频道后退出（不启动轮询，避免与常驻实例 409 冲突）
+if (process.argv.includes('--backfill')) {
+  process.exit(await backfill());
+}
 
 // 设置命令菜单（用户在 Telegram 输入 / 时可见）
 try {
