@@ -75,7 +75,7 @@ log() {
 # ---------- 开机自启 ----------
 # 环境结论（实测）:
 #   - macOS 用户级 crontab @reboot 不可靠（cron 登录时才启动，开机无会话时跳过）
-#   - home 位于外置卷 外置卷，用户级 LaunchAgent 无法加载（launchctl I/O error）
+#   - home 位于外置卷时，用户级 LaunchAgent 无法加载（launchctl I/O error）
 #   - macOS 新版 AppleScript 登录项对脚本/.app 静默失败或卡授权
 # 因此采用系统级 LaunchAgent（/Library/LaunchAgents，启动卷 ✓，需要一次 sudo 密码）：
 #   登录即启动 + KeepAlive 崩溃自动重启，最可靠。

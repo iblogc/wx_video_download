@@ -60,7 +60,7 @@ wx-video/
 
 **启动服务和开机自启是两件事**：`autostart on` 只注册（下次登录自动启动），需要现在运行请单独 `./bot.sh start`。
 
-> 实现说明：通过系统级 LaunchAgent（`/Library/LaunchAgents/com.wxvideo.bot.plist`，首次需一次 sudo 密码）。本机 home 位于外置卷 `外置卷`，用户级 LaunchAgent 无法加载（launchd 限制），crontab `@reboot` 在 macOS 用户级不可靠（已验证），因此采用系统级 LaunchAgent：登录即启动 + 崩溃自动重启。
+> 实现说明：通过系统级 LaunchAgent（`/Library/LaunchAgents/com.wxvideo.bot.plist`，首次需一次 sudo 密码）。若用户目录位于外置卷（launchd 只从启动卷加载用户级 LaunchAgent，会报 I/O error），用户级 LaunchAgent 无法加载，crontab `@reboot` 在 macOS 用户级也不可靠（已验证），因此采用系统级 LaunchAgent：登录即启动 + 崩溃自动重启。
 
 > 网络要求：Telegram API 走代理（配置文件 `proxy` 字段优先，缺省读 `http_proxy`/`https_proxy` 环境变量），视频下载走直连。
 
